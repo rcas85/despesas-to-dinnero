@@ -2,7 +2,7 @@ const { useState, useEffect, useCallback, useRef } = React;
 
 // ─── Build flags ─────────────────────────────────────────────────────────
 const IS_BETA = true;
-const APP_VERSION_BASE = "1.2.1";
+const APP_VERSION_BASE = "1.2.2";
 const APP_VERSION = IS_BETA ? `${APP_VERSION_BASE}-beta` : APP_VERSION_BASE;
 
 // ─── Constants ───────────────────────────────────────────────────────────
@@ -515,6 +515,9 @@ const Icons = {
   fileText: (
     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
   ),
+  maximize: (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+  ),
 };
 
 // ─── Styles ──────────────────────────────────────────────────────────────
@@ -938,7 +941,133 @@ html, body, #root {
 .capture-buttons .cap-btn:active { background:var(--bg3); border-color:var(--accent); color:var(--accent); }
 .capture-buttons .cap-btn .cap-icon { color:var(--text3); }
 .capture-buttons .cap-btn:active .cap-icon { color:var(--accent); }
+
+/* Attachment viewer (Fase 2, v1.2.2) */
+.viewer-overlay {
+  position:fixed; inset:0; background:rgba(0,0,0,0.92);
+  z-index:200; display:flex; flex-direction:column;
+  animation:fadeIn 0.2s;
+}
+.viewer-header {
+  display:flex; align-items:center; gap:10px;
+  padding: calc(10px + var(--safe-top)) 14px 10px;
+  background:linear-gradient(to bottom, rgba(0,0,0,0.85), rgba(0,0,0,0));
+  position:absolute; top:0; left:0; right:0; z-index:2;
+}
+.viewer-header .v-title {
+  flex:1; font-size:13px; color:var(--text2);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.viewer-header .v-close {
+  width:38px; height:38px; border-radius:50%;
+  background:rgba(255,255,255,0.12); border:none;
+  display:flex; align-items:center; justify-content:center;
+  color:white; cursor:pointer;
+}
+.viewer-header .v-close:active { background:rgba(255,255,255,0.2); }
+.viewer-body {
+  flex:1; min-height:0; overflow:auto;
+  display:flex; align-items:center; justify-content:center;
+  padding: calc(56px + var(--safe-top)) 0 calc(20px + var(--safe-bottom));
+  -webkit-overflow-scrolling:touch;
+}
+.viewer-body.pdf {
+  padding: calc(56px + var(--safe-top)) 0 calc(20px + var(--safe-bottom));
+  align-items:stretch;
+}
+.viewer-body img {
+  max-width:100%; height:auto; display:block;
+}
+.viewer-body iframe, .viewer-body embed, .viewer-body object {
+  width:100%; height:100%; border:0; background:white;
+}
+.viewer-body .pdf-frame {
+  flex:1; align-self:stretch; width:100%;
+  display:flex; flex-direction:column; min-height:60vh;
+}
+.viewer-body .pdf-fallback {
+  padding:32px 24px; text-align:center; color:var(--text2); font-size:14px;
+  line-height:1.6; align-self:center; max-width:320px;
+}
+.viewer-body .pdf-fallback a {
+  color:var(--accent); text-decoration:none; font-weight:600;
+  display:inline-block; margin-top:14px;
+  padding:10px 20px; border:1px solid var(--accent);
+  border-radius:var(--radius-sm);
+}
+
+/* Tappable preview hint */
+.preview-tappable { position:relative; cursor:pointer; }
+.preview-tappable .preview-hint {
+  position:absolute; bottom:8px; right:8px;
+  background:rgba(0,0,0,0.65); color:white;
+  padding:5px 10px; border-radius:14px;
+  font-size:11px; font-weight:500;
+  display:inline-flex; align-items:center; gap:4px;
+  pointer-events:none; backdrop-filter:blur(4px);
+}
+.preview-tappable:active { opacity:0.85; }
 `;
+
+// ─── Attachment Viewer (Fase 2, v1.2.2) ────────────────────────────────
+// Visualizador full-screen para imagens e PDFs. Read-only (só visualizar).
+function AttachmentViewer({ attachment, onClose }) {
+  if (!attachment) return null;
+  const { type, dataUrl, name } = attachment;
+  const isPdf = type === "pdf" || /^data:application\/pdf/.test(dataUrl || "");
+
+  // Fecha com Esc no desktop
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const openInNewTab = () => {
+    try {
+      const w = window.open();
+      if (!w) return;
+      if (isPdf) {
+        // Embed PDF em página simples
+        w.document.write(`<!DOCTYPE html><html><head><title>${name || "PDF"}</title><style>body{margin:0;background:#000}embed{width:100vw;height:100vh}</style></head><body><embed src="${dataUrl}" type="application/pdf"></body></html>`);
+      } else {
+        w.document.write(`<!DOCTYPE html><html><head><title>${name || "imagem"}</title><style>body{margin:0;background:#000;display:flex;align-items:center;justify-content:center;min-height:100vh}img{max-width:100%;max-height:100vh}</style></head><body><img src="${dataUrl}"></body></html>`);
+      }
+      w.document.close();
+    } catch (e) {
+      logEvent("runtime_error", "Falha ao abrir anexo em nova aba", { error: String(e?.message || e) });
+    }
+  };
+
+  return (
+    <div className="viewer-overlay" onClick={onClose}>
+      <div className="viewer-header" onClick={e => e.stopPropagation()}>
+        <span className="v-title">{name || (isPdf ? "documento.pdf" : "imagem")}</span>
+        <button className="v-close" onClick={onClose} aria-label="Fechar">
+          {Icons.x}
+        </button>
+      </div>
+      <div className={`viewer-body ${isPdf ? "pdf" : ""}`} onClick={e => e.stopPropagation()}>
+        {isPdf ? (
+          // Safari iOS não renderiza PDF dentro de iframe/embed em data URL.
+          // Oferecemos botão pra abrir em nova aba (que o iOS abre no visualizador nativo).
+          <div className="pdf-fallback">
+            <div style={{fontSize:16, color:"var(--text)", fontWeight:500, marginBottom:8}}>
+              📄 {name || "documento.pdf"}
+            </div>
+            <div>
+              No iPhone, PDFs abrem melhor no visualizador nativo do sistema.<br/>
+              Toque no botão abaixo para abrir.
+            </div>
+            <a onClick={openInNewTab}>Abrir PDF</a>
+          </div>
+        ) : (
+          <img src={dataUrl} alt={name || "anexo"} />
+        )}
+      </div>
+    </div>
+  );
+}
 
 // ─── Main App ────────────────────────────────────────────────────────────
 function App() {
@@ -1410,6 +1539,7 @@ function CapturePage({ trip, config, onSave, onBack }) {
   const [cnpj, setCnpj] = useState(null);
   // Fase 2: anexo (imagem ou PDF)
   const [attachment, setAttachment] = useState(null); // {type: 'image'|'pdf', dataUrl, name, size}
+  const [showViewer, setShowViewer] = useState(false);
   const fileRef = useRef(null);
   const pdfRef = useRef(null);
 
@@ -1565,20 +1695,30 @@ function CapturePage({ trip, config, onSave, onBack }) {
             <div className="section-head">Anexo da despesa</div>
 
             {attachment?.type === "pdf" ? (
-              <div className="pdf-card">
+              <div className="pdf-card preview-tappable" onClick={() => setShowViewer(true)}>
                 <div className="pdf-icon">{Icons.fileText}</div>
                 <div className="pdf-body">
                   <div className="pdf-name">{attachment.name}</div>
-                  <div className="pdf-sub">PDF · {attachment.size ? `${(attachment.size/1024).toFixed(0)} KB` : "anexado"}</div>
+                  <div className="pdf-sub">PDF · {attachment.size ? `${(attachment.size/1024).toFixed(0)} KB` : "anexado"} · toque para visualizar</div>
                 </div>
-                <button className="ai-action" style={{borderColor:"var(--text3)", color:"var(--text2)"}} onClick={() => { setAttachment(null); setPhoto(null); }}>
+                <button className="ai-action" style={{borderColor:"var(--text3)", color:"var(--text2)"}}
+                  onClick={(e) => { e.stopPropagation(); setAttachment(null); setPhoto(null); }}>
                   Trocar
                 </button>
               </div>
             ) : photo ? (
-              <div className="photo-area" onClick={() => fileRef.current?.click()}>
-                <img src={photo} alt="NF" />
-              </div>
+              <>
+                <div className="photo-area preview-tappable" onClick={() => setShowViewer(true)} style={{cursor:"pointer"}}>
+                  <img src={photo} alt="NF" />
+                  <span className="preview-hint">{Icons.maximize} ver completa</span>
+                </div>
+                <div style={{padding:"0 16px 8px", display:"flex", justifyContent:"flex-end"}}>
+                  <button className="ai-action" style={{borderColor:"var(--text3)", color:"var(--text2)"}}
+                    onClick={() => { setAttachment(null); setPhoto(null); fileRef.current?.click(); }}>
+                    Trocar foto
+                  </button>
+                </div>
+              </>
             ) : (
               <div className="capture-buttons">
                 <button className="cap-btn" onClick={() => fileRef.current?.click()}>
@@ -1605,16 +1745,19 @@ function CapturePage({ trip, config, onSave, onBack }) {
           <>
             <div className="section-head">Dados da despesa</div>
             {attachment?.type === "pdf" ? (
-              <div className="pdf-card" style={{margin:"0 16px 12px"}}>
+              <div className="pdf-card preview-tappable" style={{margin:"0 16px 12px"}} onClick={() => setShowViewer(true)}>
                 <div className="pdf-icon">{Icons.fileText}</div>
                 <div className="pdf-body">
                   <div className="pdf-name">{attachment.name}</div>
-                  <div className="pdf-sub">PDF · {attachment.size ? `${(attachment.size/1024).toFixed(0)} KB` : "anexado"}</div>
+                  <div className="pdf-sub">PDF · {attachment.size ? `${(attachment.size/1024).toFixed(0)} KB` : "anexado"} · toque para visualizar</div>
                 </div>
+                <span style={{color:"var(--text3)", display:"flex"}}>{Icons.maximize}</span>
               </div>
             ) : photo && (
-              <div style={{ margin:"0 16px 12px", borderRadius:12, overflow:"hidden", height:120 }}>
+              <div className="preview-tappable" style={{ margin:"0 16px 12px", borderRadius:12, overflow:"hidden", height:120 }}
+                onClick={() => setShowViewer(true)}>
                 <img src={photo} alt="NF" style={{ width:"100%", height:"100%", objectFit:"cover" }} />
+                <span className="preview-hint">{Icons.maximize} ver completa</span>
               </div>
             )}
 
@@ -1803,6 +1946,10 @@ function CapturePage({ trip, config, onSave, onBack }) {
         )}
         <div className="safe-bottom" />
       </div>
+
+      {showViewer && attachment && (
+        <AttachmentViewer attachment={attachment} onClose={() => setShowViewer(false)} />
+      )}
     </div>
   );
 }
@@ -1834,6 +1981,13 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
   const attachmentType = expense.captura?.anexo_tipo || (expense.captura?.foto_thumbnail_base64?.startsWith("data:application/pdf") ? "pdf" : "image");
   const attachmentName = expense.captura?.anexo_nome_original || null;
   const photo = expense.captura?.foto_thumbnail_base64;
+  const [showViewer, setShowViewer] = useState(false);
+  // Reconstrói objeto de anexo para o viewer
+  const attachmentForViewer = photo ? {
+    type: attachmentType,
+    dataUrl: photo,
+    name: attachmentName || (attachmentType === "pdf" ? "documento.pdf" : "foto.jpg"),
+  } : null;
 
   const hasKey = !!(config.gemini_api_key && config.gemini_api_key.trim());
   const isMeal = MEAL_CATEGORIES.includes(cat);
@@ -1919,16 +2073,19 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
 
       <div className="scroll">
         {photo && attachmentType === "pdf" ? (
-          <div className="pdf-card" style={{margin:"12px 16px 0"}}>
+          <div className="pdf-card preview-tappable" style={{margin:"12px 16px 0"}} onClick={() => setShowViewer(true)}>
             <div className="pdf-icon">{Icons.fileText}</div>
             <div className="pdf-body">
               <div className="pdf-name">{attachmentName || "documento.pdf"}</div>
-              <div className="pdf-sub">PDF anexado</div>
+              <div className="pdf-sub">PDF anexado · toque para visualizar</div>
             </div>
+            <span style={{color:"var(--text3)", display:"flex"}}>{Icons.maximize}</span>
           </div>
         ) : photo && (
-          <div style={{ margin:"12px 16px 0", borderRadius:12, overflow:"hidden", height:140 }}>
+          <div className="preview-tappable" style={{ margin:"12px 16px 0", borderRadius:12, overflow:"hidden", height:140 }}
+            onClick={() => setShowViewer(true)}>
             <img src={photo} alt="NF" style={{ width:"100%", height:"100%", objectFit:"cover" }} />
+            <span className="preview-hint">{Icons.maximize} ver completa</span>
           </div>
         )}
 
@@ -2119,6 +2276,10 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
             <div className="safe-bottom" />
           </div>
         </div>
+      )}
+
+      {showViewer && attachmentForViewer && (
+        <AttachmentViewer attachment={attachmentForViewer} onClose={() => setShowViewer(false)} />
       )}
     </div>
   );
