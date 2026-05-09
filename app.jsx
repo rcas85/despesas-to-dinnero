@@ -133,6 +133,154 @@ async function dbGet(store, key) {
   });
 }
 
+// ─── Gemini API (Fase 2) ────────────────────────────────────────────────
+// Documentação: https://ai.google.dev/gemini-api/docs
+// Modelo: gemini-2.5-flash | Free tier: 1500 req/dia
+const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+
+const EXTRACTION_PROMPT_TEMPLATE = `Você é um assistente de extração de dados de notas fiscais e cupons fiscais brasileiros.
+
+Analise a imagem da NF/cupom fiscal/comprovante e extraia os dados em JSON.
+
+Retorne APENAS um JSON válido (sem markdown, sem comentários, sem texto antes ou depois) com os campos:
+
+{
+  "estabelecimento": string,        // razão social ou nome fantasia legível, sem CNPJ junto
+  "cnpj": string ou null,           // formato XX.XXX.XXX/XXXX-XX, ou null se ilegível
+  "valor_total": number,            // em reais, com 2 decimais, apenas o total final
+  "data_despesa": string,           // formato YYYY-MM-DD
+  "horario": string ou null,        // formato HH:MM, ou null se não houver
+  "categoria_sugerida": string,     // exatamente uma das categorias da lista abaixo
+  "confianca": number               // 0 a 1, sua confiança média na extração
+}
+
+CATEGORIAS POSSÍVEIS (escolha exatamente uma, escrevendo idêntico):
+__CATEGORIES__
+
+HEURÍSTICAS PARA SUGERIR CATEGORIA:
+- Hotel/pousada/resort/flat/inn → "Hospedagens"
+- Posto de combustível (Shell, Ipiranga, BR, Petrobras, Raízen, etc.) → "Combustível em viagem"
+- Restaurante + horário 11h-14h → "Almoço viagem - brasil"
+- Restaurante + horário 19h-22h → "Jantar viagem - brasil"
+- Padaria/cafeteria/lanchonete + horário antes de 10h → "Café da manhã - brasil"
+- Padaria/lanchonete em horário fora de café → "Lanches/lapas em percurso de viagem"
+- Uber, 99, Táxi, Cabify → "Táxi em viagens"
+- Estacionamento/Estapar/Multipark/Pedágio/CCR → "Estacionamento/pedagio em viagem"
+- Companhia aérea (Latam, Gol, Azul, Avianca) → "Passagens aéreas"
+- Locadora de veículos (Localiza, Movida, Unidas) → "Aluguel de veículos em viagem"
+- Lava-jato, lava-rápido → "Lavação/higienização de veículos"
+
+Se não conseguir determinar com clareza, prefira deixar a categoria mais genérica de viagem ou retornar string vazia. Se algum campo for ilegível, retorne null nesse campo (mas o JSON precisa ser válido).`;
+
+function buildExtractionPrompt() {
+  return EXTRACTION_PROMPT_TEMPLATE.replace("__CATEGORIES__", CATEGORIES.map(c => `- ${c}`).join("\n"));
+}
+
+// Extrai o mime type e o base64 puro de uma data URL
+function parseDataUrl(dataUrl) {
+  const m = /^data:([^;]+);base64,(.+)$/.exec(dataUrl || "");
+  if (!m) return null;
+  return { mimeType: m[1], data: m[2] };
+}
+
+// Extrai JSON de uma resposta que pode vir com cercas ```json ... ```
+function safeParseJson(text) {
+  if (!text) return null;
+  let t = String(text).trim();
+  // Remove cercas markdown se existirem
+  t = t.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  // Pega do primeiro { ao último }
+  const a = t.indexOf("{");
+  const b = t.lastIndexOf("}");
+  if (a >= 0 && b > a) t = t.slice(a, b + 1);
+  try { return JSON.parse(t); } catch { return null; }
+}
+
+async function geminiExtractFromImage(apiKey, photoDataUrl) {
+  if (!apiKey) throw new Error("Chave Gemini não configurada");
+  const parsed = parseDataUrl(photoDataUrl);
+  if (!parsed) throw new Error("Imagem inválida");
+
+  const body = {
+    contents: [{
+      parts: [
+        { text: buildExtractionPrompt() },
+        { inline_data: { mime_type: parsed.mimeType, data: parsed.data } },
+      ],
+    }],
+    generationConfig: {
+      temperature: 0.1,
+      responseMimeType: "application/json",
+    },
+  };
+
+  const url = `${GEMINI_URL}?key=${encodeURIComponent(apiKey)}`;
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    throw new Error("Sem conexão com o Gemini");
+  }
+
+  if (!resp.ok) {
+    let msg = `Gemini retornou ${resp.status}`;
+    try {
+      const err = await resp.json();
+      if (err?.error?.message) msg = err.error.message;
+    } catch {}
+    throw new Error(msg);
+  }
+
+  const json = await resp.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  const data = safeParseJson(text);
+  if (!data) throw new Error("Resposta da IA em formato inesperado");
+
+  // Normaliza
+  return {
+    estabelecimento: data.estabelecimento || "",
+    cnpj: data.cnpj || null,
+    valor_total: typeof data.valor_total === "number" ? data.valor_total : parseFloat(data.valor_total) || 0,
+    data_despesa: data.data_despesa || todayISO(),
+    horario: data.horario || null,
+    categoria_sugerida: data.categoria_sugerida && CATEGORIES.includes(data.categoria_sugerida) ? data.categoria_sugerida : "",
+    confianca: typeof data.confianca === "number" ? data.confianca : 0.5,
+  };
+}
+
+async function geminiTestKey(apiKey) {
+  if (!apiKey || !apiKey.trim()) throw new Error("Cole a chave antes de testar");
+  const url = `${GEMINI_URL}?key=${encodeURIComponent(apiKey.trim())}`;
+  const body = {
+    contents: [{ parts: [{ text: "responda apenas com a palavra OK" }] }],
+    generationConfig: { temperature: 0, maxOutputTokens: 10 },
+  };
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw new Error("Sem conexão com a internet");
+  }
+  if (!resp.ok) {
+    let msg = `Erro ${resp.status}`;
+    try {
+      const err = await resp.json();
+      if (err?.error?.message) msg = err.error.message;
+    } catch {}
+    throw new Error(msg);
+  }
+  return true;
+}
+
 // ─── Icons (inline SVG) ─────────────────────────────────────────────────
 const Icons = {
   plus: (
@@ -179,6 +327,21 @@ const Icons = {
   ),
   x: (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+  ),
+  sparkle: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3l1.9 5.6L19.5 10.5l-5.6 1.9L12 18l-1.9-5.6L4.5 10.5l5.6-1.9z"/><path d="M19 4l.7 2.1L21.8 7l-2.1.7L19 9.8l-.7-2.1L16.2 7l2.1-.7z"/></svg>
+  ),
+  eye: (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+  ),
+  eyeOff: (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+  ),
+  refresh: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+  ),
+  alert: (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
   ),
 };
 
@@ -478,6 +641,96 @@ html, body, #root {
 .settings-row .s-icon { color:var(--text3); flex-shrink:0; }
 .settings-row .s-label { flex:1; font-size:14px; }
 .settings-row .s-value { font-size:13px; color:var(--text3); max-width:50%; text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+/* AI banner inside capture (Fase 2) */
+.ai-banner {
+  display:flex; align-items:center; gap:10px;
+  margin:0 16px 12px; padding:10px 12px;
+  border-radius:var(--radius-sm); font-size:13px;
+  border:1px solid transparent; line-height:1.4;
+}
+.ai-banner.loading { background:var(--blue-dim); border-color:rgba(96,165,250,0.25); color:var(--blue); }
+.ai-banner.success { background:var(--accent-dim); border-color:rgba(74,222,128,0.25); color:var(--accent); }
+.ai-banner.warn    { background:var(--warn-dim);  border-color:rgba(245,158,11,0.25); color:var(--warn); }
+.ai-banner.error   { background:var(--danger-dim); border-color:rgba(239,68,68,0.25); color:var(--danger); }
+.ai-banner .ai-icon { display:flex; flex-shrink:0; }
+.ai-banner .ai-text { flex:1; }
+.ai-banner .ai-action {
+  background:none; border:1px solid currentColor; color:inherit;
+  border-radius:20px; padding:4px 10px; font-size:12px; font-weight:600;
+  font-family:var(--font); cursor:pointer; flex-shrink:0;
+  display:inline-flex; align-items:center; gap:4px;
+}
+.ai-banner .ai-action:active { opacity:0.7; }
+.ai-banner .ai-action:disabled { opacity:0.5; pointer-events:none; }
+
+/* Spinner */
+.spinner {
+  width:14px; height:14px; border-radius:50%;
+  border:2px solid currentColor; border-top-color:transparent;
+  animation: spin 0.7s linear infinite; flex-shrink:0;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Confidence badge next to field labels */
+.field-label-row {
+  display:flex; align-items:center; justify-content:space-between;
+  margin-bottom:6px;
+}
+.field-label-row label { margin:0 !important; }
+.conf-badge {
+  display:inline-flex; align-items:center; gap:3px;
+  font-size:10px; font-weight:600; padding:2px 7px; border-radius:12px;
+  text-transform:uppercase; letter-spacing:0.4px;
+}
+.conf-badge.ok    { background:var(--accent-dim); color:var(--accent); }
+.conf-badge.check { background:var(--warn-dim);   color:var(--warn); }
+
+/* Suggested category chip on top of cat list */
+.suggest-cat {
+  display:flex; align-items:center; gap:8px;
+  margin:0 16px 8px; padding:10px 12px;
+  background:var(--accent-dim2); border:1px dashed rgba(74,222,128,0.3);
+  border-radius:var(--radius-sm); font-size:13px; color:var(--text2);
+}
+.suggest-cat strong { color:var(--accent); font-weight:600; }
+.suggest-cat .sc-x {
+  margin-left:auto; background:none; border:none; color:var(--text3);
+  cursor:pointer; padding:2px; display:flex;
+}
+
+/* API key row in settings (Fase 2) */
+.api-key-row {
+  display:flex; gap:8px; padding:0 16px; align-items:stretch; margin-bottom:8px;
+}
+.api-key-row input {
+  flex:1; background:var(--bg3); border:1px solid var(--border);
+  border-radius:var(--radius-sm); padding:10px 12px; color:var(--text);
+  font-family:var(--mono); font-size:13px; outline:none;
+}
+.api-key-row input:focus { border-color:var(--border2); }
+.api-key-row .icon-btn {
+  background:var(--bg3); border:1px solid var(--border);
+  border-radius:var(--radius-sm); padding:0 12px;
+  color:var(--text2); cursor:pointer; display:flex; align-items:center;
+}
+.api-key-row .icon-btn:active { background:var(--bg4); }
+
+.test-btn-row {
+  display:flex; align-items:center; gap:10px;
+  padding:0 16px; margin-bottom:8px;
+}
+.test-btn {
+  background:var(--bg3); border:1px solid var(--border2);
+  color:var(--text); border-radius:var(--radius-sm);
+  padding:8px 14px; font-family:var(--font); font-size:13px; font-weight:500;
+  cursor:pointer; display:inline-flex; align-items:center; gap:6px;
+}
+.test-btn:active { background:var(--bg4); }
+.test-btn:disabled { opacity:0.5; pointer-events:none; }
+.test-result { font-size:12px; flex:1; }
+.test-result.ok { color:var(--accent); }
+.test-result.bad { color:var(--danger); }
 `;
 
 // ─── Main App ────────────────────────────────────────────────────────────
@@ -487,7 +740,7 @@ function App() {
   const [currentTrip, setCurrentTrip] = useState(null);
   const [currentExpense, setCurrentExpense] = useState(null);
   const [toast, setToast] = useState(null);
-  const [config, setConfig] = useState({ nome: "", participantes_frequentes: [] });
+  const [config, setConfig] = useState({ nome: "", participantes_frequentes: [], gemini_api_key: "" });
   const [loaded, setLoaded] = useState(false);
 
   // Load data
@@ -930,17 +1183,63 @@ function CapturePage({ trip, config, onSave, onBack }) {
   const [km, setKm] = useState("");
   const [participantes, setParticipantes] = useState([]);
   const [newParticipant, setNewParticipant] = useState("");
+  // Fase 2: estado da extração via Gemini
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState(null);
+  const [aiExtracted, setAiExtracted] = useState(false);
+  const [aiConfidence, setAiConfidence] = useState(null);
+  const [catSuggested, setCatSuggested] = useState("");
+  const [horario, setHorario] = useState(null);
+  const [cnpj, setCnpj] = useState(null);
   const fileRef = useRef(null);
 
+  const hasKey = !!(config.gemini_api_key && config.gemini_api_key.trim());
   const isMeal = MEAL_CATEGORIES.includes(cat);
   const profile = CATEGORY_PROFILES[cat];
   const needsConditional = !!profile?.campo;
+
+  // Confiança visual: alta (>=0.8) verde, média (0.6-0.8) amarelo, abaixo: pede revisão
+  const confLevel = aiConfidence == null ? null : (aiConfidence >= 0.8 ? "ok" : "check");
+
+  const runExtraction = async (dataUrl) => {
+    setAiLoading(true);
+    setAiError(null);
+    setAiExtracted(false);
+    setCatSuggested("");
+    try {
+      const r = await geminiExtractFromImage(config.gemini_api_key.trim(), dataUrl);
+      if (r.estabelecimento) setEstab(r.estabelecimento);
+      if (r.valor_total) setValor(r.valor_total.toFixed(2).replace(".", ","));
+      if (r.data_despesa) setData(r.data_despesa);
+      if (r.horario) setHorario(r.horario);
+      if (r.cnpj) setCnpj(r.cnpj);
+      if (r.categoria_sugerida) setCatSuggested(r.categoria_sugerida);
+      setAiConfidence(r.confianca);
+      setAiExtracted(true);
+    } catch (e) {
+      setAiError(e.message || "Falha ao extrair");
+    } finally {
+      setAiLoading(false);
+    }
+  };
 
   const handlePhoto = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => { setPhoto(reader.result); setStep(1); };
+    reader.onload = () => {
+      const dataUrl = reader.result;
+      setPhoto(dataUrl);
+      setStep(1);
+      // Dispara extração se houver chave + internet
+      if (hasKey && navigator.onLine) {
+        runExtraction(dataUrl);
+      } else if (!hasKey) {
+        setAiError("Sem chave Gemini configurada — preencha manualmente ou adicione em Configurações.");
+      } else {
+        setAiError("Sem internet — preencha manualmente. Você pode re-extrair depois.");
+      }
+    };
     reader.readAsDataURL(file);
   };
 
@@ -955,11 +1254,12 @@ function CapturePage({ trip, config, onSave, onBack }) {
       },
       dados_nf: {
         estabelecimento: estab.trim() || "Sem nome",
-        cnpj: null,
+        cnpj: cnpj || null,
         valor: valNum,
         data_despesa: data,
-        extraido_por_ia: false,
-        confianca_extracao: null,
+        horario: horario || null,
+        extraido_por_ia: aiExtracted,
+        confianca_extracao: aiConfidence,
       },
       categoria_dinnero: cat,
       justificativa: justificativa.trim(),
@@ -1040,17 +1340,61 @@ function CapturePage({ trip, config, onSave, onBack }) {
                 <img src={photo} alt="NF" style={{ width:"100%", height:"100%", objectFit:"cover" }} />
               </div>
             )}
+
+            {/* Banner de status da IA */}
+            {aiLoading && (
+              <div className="ai-banner loading">
+                <span className="ai-icon spinner" />
+                <span className="ai-text">Extraindo dados com IA…</span>
+              </div>
+            )}
+            {!aiLoading && aiExtracted && !aiError && (
+              <div className="ai-banner success">
+                <span className="ai-icon">{Icons.sparkle}</span>
+                <span className="ai-text">
+                  {confLevel === "ok"
+                    ? "Dados extraídos. Confira e ajuste se necessário."
+                    : "Dados extraídos com confiança baixa. Revise os campos."}
+                </span>
+                {photo && hasKey && (
+                  <button className="ai-action" onClick={() => runExtraction(photo)} disabled={aiLoading}>
+                    {Icons.refresh}
+                  </button>
+                )}
+              </div>
+            )}
+            {!aiLoading && aiError && (
+              <div className="ai-banner warn">
+                <span className="ai-icon">{Icons.alert}</span>
+                <span className="ai-text">{aiError}</span>
+                {photo && hasKey && navigator.onLine && (
+                  <button className="ai-action" onClick={() => runExtraction(photo)} disabled={aiLoading}>
+                    {Icons.refresh} Tentar
+                  </button>
+                )}
+              </div>
+            )}
+
             <div className="field">
-              <label>Estabelecimento</label>
-              <input placeholder="Nome do estabelecimento" value={estab} onChange={e => setEstab(e.target.value)} autoFocus />
+              <div className="field-label-row">
+                <label>Estabelecimento</label>
+                {confLevel && <span className={`conf-badge ${confLevel}`}>{confLevel === "ok" ? "IA" : "Verifique"}</span>}
+              </div>
+              <input placeholder="Nome do estabelecimento" value={estab} onChange={e => setEstab(e.target.value)} autoFocus={!aiExtracted} />
             </div>
             <div style={{ display:"flex", gap:8, padding:"0 16px" }}>
               <div className="field" style={{ flex:1, margin:0 }}>
-                <label>Valor (R$)</label>
+                <div className="field-label-row">
+                  <label>Valor (R$)</label>
+                  {confLevel && <span className={`conf-badge ${confLevel}`}>{confLevel === "ok" ? "IA" : "✓?"}</span>}
+                </div>
                 <input placeholder="0,00" value={valor} onChange={e => setValor(e.target.value)} inputMode="decimal" />
               </div>
               <div className="field" style={{ flex:1, margin:0 }}>
-                <label>Data</label>
+                <div className="field-label-row">
+                  <label>Data</label>
+                  {confLevel && <span className={`conf-badge ${confLevel}`}>{confLevel === "ok" ? "IA" : "✓?"}</span>}
+                </div>
                 <input type="date" value={data} onChange={e => setData(e.target.value)} />
               </div>
             </div>
@@ -1064,6 +1408,19 @@ function CapturePage({ trip, config, onSave, onBack }) {
         {step === 2 && (
           <>
             <div className="section-head">Categoria</div>
+
+            {/* Sugestão da IA, aparece se foi extraída e ainda não foi escolhida igual */}
+            {catSuggested && cat !== catSuggested && (
+              <div className="suggest-cat">
+                <span style={{display:"flex"}}>{Icons.sparkle}</span>
+                <span>Sugerimos: <strong>{catSuggested}</strong></span>
+                <button className="ai-action" style={{borderColor:"var(--accent)", color:"var(--accent)"}} onClick={() => setCat(catSuggested)}>
+                  Aplicar
+                </button>
+                <button className="sc-x" onClick={() => setCatSuggested("")} aria-label="Dispensar">{Icons.x}</button>
+              </div>
+            )}
+
             <div className="cat-quick">
               {QUICK_CATEGORIES.map(c => (
                 <div key={c} className={`cat-item ${cat === c ? "sel" : ""}`}
@@ -1178,8 +1535,16 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
   const [newParticipant, setNewParticipant] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [reviewed, setReviewed] = useState(expense.status_revisao === "revisado");
+  // Fase 2: re-extração
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState(null);
+  const [aiInfo, setAiInfo] = useState(null); // {confianca}
+  const [catSuggested, setCatSuggested] = useState("");
+  const [horario, setHorario] = useState(expense.dados_nf?.horario || null);
+  const [cnpj, setCnpj] = useState(expense.dados_nf?.cnpj || null);
   const photo = expense.captura?.foto_thumbnail_base64;
 
+  const hasKey = !!(config.gemini_api_key && config.gemini_api_key.trim());
   const isMeal = MEAL_CATEGORIES.includes(cat);
   const profile = CATEGORY_PROFILES[cat];
   const needsConditional = !!profile?.campo;
@@ -1203,7 +1568,17 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
     const valNum = parseFloat(valor.replace(",", ".")) || 0;
     const updated = {
       ...expense,
-      dados_nf: { ...expense.dados_nf, estabelecimento: estab.trim(), valor: valNum, data_despesa: data },
+      dados_nf: {
+        ...expense.dados_nf,
+        estabelecimento: estab.trim(),
+        valor: valNum,
+        data_despesa: data,
+        cnpj: cnpj || expense.dados_nf?.cnpj || null,
+        horario: horario || expense.dados_nf?.horario || null,
+        // se fez re-extração, atualiza; senão mantém o que veio
+        extraido_por_ia: aiInfo ? true : !!expense.dados_nf?.extraido_por_ia,
+        confianca_extracao: aiInfo ? aiInfo.confianca : (expense.dados_nf?.confianca_extracao ?? null),
+      },
       categoria_dinnero: cat,
       justificativa: justificativa.trim(),
       campos_condicionais: {
@@ -1218,6 +1593,26 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
     onSave(updated);
   };
 
+  const reExtract = async () => {
+    if (!photo || !hasKey) return;
+    setAiLoading(true);
+    setAiError(null);
+    try {
+      const r = await geminiExtractFromImage(config.gemini_api_key.trim(), photo);
+      if (r.estabelecimento) setEstab(r.estabelecimento);
+      if (r.valor_total) setValor(r.valor_total.toFixed(2).replace(".", ","));
+      if (r.data_despesa) setData(r.data_despesa);
+      if (r.horario) setHorario(r.horario);
+      if (r.cnpj) setCnpj(r.cnpj);
+      if (r.categoria_sugerida) setCatSuggested(r.categoria_sugerida);
+      setAiInfo({ confianca: r.confianca });
+    } catch (e) {
+      setAiError(e.message || "Falha ao re-extrair");
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
   return (
     <div className="page">
       <div className="header">
@@ -1230,6 +1625,55 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
         {photo && (
           <div style={{ margin:"12px 16px 0", borderRadius:12, overflow:"hidden", height:140 }}>
             <img src={photo} alt="NF" style={{ width:"100%", height:"100%", objectFit:"cover" }} />
+          </div>
+        )}
+
+        {/* Botão re-extrair com IA (Fase 2) */}
+        {photo && (
+          <div style={{ padding:"12px 16px 0" }}>
+            {aiLoading ? (
+              <div className="ai-banner loading" style={{margin:0}}>
+                <span className="ai-icon spinner" />
+                <span className="ai-text">Re-extraindo com IA…</span>
+              </div>
+            ) : aiError ? (
+              <div className="ai-banner warn" style={{margin:0}}>
+                <span className="ai-icon">{Icons.alert}</span>
+                <span className="ai-text">{aiError}</span>
+                {hasKey && navigator.onLine && (
+                  <button className="ai-action" onClick={reExtract}>
+                    {Icons.refresh}
+                  </button>
+                )}
+              </div>
+            ) : aiInfo ? (
+              <div className="ai-banner success" style={{margin:0}}>
+                <span className="ai-icon">{Icons.sparkle}</span>
+                <span className="ai-text">
+                  Re-extraído com sucesso{aiInfo.confianca != null ? ` (confiança ${(aiInfo.confianca*100).toFixed(0)}%)` : ""}.
+                </span>
+              </div>
+            ) : hasKey ? (
+              <button className="fab secondary small" style={{margin:0, width:"100%"}} onClick={reExtract}>
+                {Icons.sparkle} Re-extrair com IA
+              </button>
+            ) : (
+              <div className="ai-banner warn" style={{margin:0}}>
+                <span className="ai-icon">{Icons.alert}</span>
+                <span className="ai-text">Configure a chave Gemini em Configurações para usar a IA.</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {catSuggested && cat !== catSuggested && (
+          <div className="suggest-cat" style={{marginTop:12}}>
+            <span style={{display:"flex"}}>{Icons.sparkle}</span>
+            <span>Sugerimos: <strong>{catSuggested}</strong></span>
+            <button className="ai-action" style={{borderColor:"var(--accent)", color:"var(--accent)"}} onClick={() => setCat(catSuggested)}>
+              Aplicar
+            </button>
+            <button className="sc-x" onClick={() => setCatSuggested("")} aria-label="Dispensar">{Icons.x}</button>
           </div>
         )}
 
@@ -1490,6 +1934,11 @@ function SettingsPage({ config, onSave, onBack, showToast }) {
   const [nome, setNome] = useState(config.nome || "");
   const [partList, setPartList] = useState(config.participantes_frequentes || []);
   const [newPart, setNewPart] = useState("");
+  // Fase 2: chave Gemini
+  const [apiKey, setApiKey] = useState(config.gemini_api_key || "");
+  const [showKey, setShowKey] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState(null); // {ok: bool, msg: string}
 
   const addPart = () => {
     const n = newPart.trim().toUpperCase();
@@ -1497,8 +1946,26 @@ function SettingsPage({ config, onSave, onBack, showToast }) {
     setNewPart("");
   };
 
+  const handleTest = async () => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      await geminiTestKey(apiKey.trim());
+      setTestResult({ ok: true, msg: "Chave válida e ativa." });
+    } catch (e) {
+      setTestResult({ ok: false, msg: e.message || "Falha ao testar" });
+    } finally {
+      setTesting(false);
+    }
+  };
+
   const handleSave = () => {
-    onSave({ ...config, nome, participantes_frequentes: partList });
+    onSave({
+      ...config,
+      nome,
+      participantes_frequentes: partList,
+      gemini_api_key: apiKey.trim(),
+    });
     showToast("Configurações salvas");
     onBack();
   };
@@ -1515,6 +1982,43 @@ function SettingsPage({ config, onSave, onBack, showToast }) {
         <div className="field">
           <label>Nome completo</label>
           <input placeholder="Ricardo Assmann" value={nome} onChange={e => setNome(e.target.value)} />
+        </div>
+
+        <div className="section-head">Inteligência artificial</div>
+        <div style={{ padding:"0 16px 8px", fontSize:12, color:"var(--text3)", lineHeight:1.45 }}>
+          Chave da API Gemini (Google) usada para extrair dados das notas fiscais automaticamente.
+          Crie a sua gratuitamente em <span style={{color:"var(--accent)"}}>aistudio.google.com/apikey</span>.
+          A chave fica guardada apenas neste dispositivo.
+        </div>
+        <div style={{padding:"0 16px 6px"}}>
+          <label style={{fontSize:12, fontWeight:500, color:"var(--text2)", textTransform:"uppercase", letterSpacing:"0.5px"}}>
+            Chave API Gemini
+          </label>
+        </div>
+        <div className="api-key-row">
+          <input
+            type={showKey ? "text" : "password"}
+            placeholder="AIza…"
+            value={apiKey}
+            onChange={e => { setApiKey(e.target.value); setTestResult(null); }}
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+          />
+          <button className="icon-btn" onClick={() => setShowKey(!showKey)} aria-label="Mostrar/ocultar chave">
+            {showKey ? Icons.eyeOff : Icons.eye}
+          </button>
+        </div>
+        <div className="test-btn-row">
+          <button className="test-btn" onClick={handleTest} disabled={!apiKey.trim() || testing}>
+            {testing ? <span className="spinner" /> : Icons.sparkle}
+            {testing ? "Testando…" : "Testar conexão"}
+          </button>
+          {testResult && (
+            <span className={`test-result ${testResult.ok ? "ok" : "bad"}`}>
+              {testResult.ok ? "✓ " : "✗ "}{testResult.msg}
+            </span>
+          )}
         </div>
 
         <div className="section-head">Participantes frequentes</div>
@@ -1546,7 +2050,7 @@ function SettingsPage({ config, onSave, onBack, showToast }) {
           {Icons.check} Salvar configurações
         </button>
         <div style={{ padding:"24px 16px 8px", textAlign:"center", fontSize:11, color:"var(--text3)" }}>
-          Despesas to Dinnero · PWA v1.0.1
+          Despesas to Dinnero · PWA v1.1.0
         </div>
         <div className="safe-bottom" />
       </div>
