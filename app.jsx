@@ -2,7 +2,7 @@ const { useState, useEffect, useCallback, useRef } = React;
 
 // ─── Build flags ─────────────────────────────────────────────────────────
 const IS_BETA = true;
-const APP_VERSION_BASE = "1.2.2";
+const APP_VERSION_BASE = "1.2.3";
 const APP_VERSION = IS_BETA ? `${APP_VERSION_BASE}-beta` : APP_VERSION_BASE;
 
 // ─── Constants ───────────────────────────────────────────────────────────
@@ -1015,6 +1015,8 @@ function AttachmentViewer({ attachment, onClose }) {
   if (!attachment) return null;
   const { type, dataUrl, name } = attachment;
   const isPdf = type === "pdf" || /^data:application\/pdf/.test(dataUrl || "");
+  const [pdfBlobUrl, setPdfBlobUrl] = useState(null);
+  const [pdfError, setPdfError] = useState(null);
 
   // Fecha com Esc no desktop
   useEffect(() => {
@@ -1023,21 +1025,28 @@ function AttachmentViewer({ attachment, onClose }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  const openInNewTab = () => {
+  // Converte data URL → Blob URL (Safari iOS renderiza PDFs em blob: muito melhor que em data:)
+  useEffect(() => {
+    if (!isPdf || !dataUrl) return;
+    let blobUrl = null;
     try {
-      const w = window.open();
-      if (!w) return;
-      if (isPdf) {
-        // Embed PDF em página simples
-        w.document.write(`<!DOCTYPE html><html><head><title>${name || "PDF"}</title><style>body{margin:0;background:#000}embed{width:100vw;height:100vh}</style></head><body><embed src="${dataUrl}" type="application/pdf"></body></html>`);
-      } else {
-        w.document.write(`<!DOCTYPE html><html><head><title>${name || "imagem"}</title><style>body{margin:0;background:#000;display:flex;align-items:center;justify-content:center;min-height:100vh}img{max-width:100%;max-height:100vh}</style></head><body><img src="${dataUrl}"></body></html>`);
-      }
-      w.document.close();
+      // data:application/pdf;base64,XXX → bytes
+      const m = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
+      if (!m) throw new Error("data URL inválida");
+      const byteString = atob(m[2]);
+      const bytes = new Uint8Array(byteString.length);
+      for (let i = 0; i < byteString.length; i++) bytes[i] = byteString.charCodeAt(i);
+      const blob = new Blob([bytes], { type: m[1] });
+      blobUrl = URL.createObjectURL(blob);
+      setPdfBlobUrl(blobUrl);
     } catch (e) {
-      logEvent("runtime_error", "Falha ao abrir anexo em nova aba", { error: String(e?.message || e) });
+      setPdfError(String(e?.message || e));
+      logEvent("runtime_error", "Falha ao converter PDF para blob URL", { error: String(e?.message || e) });
     }
-  };
+    return () => {
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+    };
+  }, [isPdf, dataUrl]);
 
   return (
     <div className="viewer-overlay" onClick={onClose}>
@@ -1049,18 +1058,23 @@ function AttachmentViewer({ attachment, onClose }) {
       </div>
       <div className={`viewer-body ${isPdf ? "pdf" : ""}`} onClick={e => e.stopPropagation()}>
         {isPdf ? (
-          // Safari iOS não renderiza PDF dentro de iframe/embed em data URL.
-          // Oferecemos botão pra abrir em nova aba (que o iOS abre no visualizador nativo).
-          <div className="pdf-fallback">
-            <div style={{fontSize:16, color:"var(--text)", fontWeight:500, marginBottom:8}}>
-              📄 {name || "documento.pdf"}
+          pdfError ? (
+            <div className="pdf-fallback">
+              <div style={{fontSize:16, color:"var(--text)", fontWeight:500, marginBottom:8}}>
+                📄 {name || "documento.pdf"}
+              </div>
+              <div>Não consegui renderizar este PDF: {pdfError}</div>
             </div>
-            <div>
-              No iPhone, PDFs abrem melhor no visualizador nativo do sistema.<br/>
-              Toque no botão abaixo para abrir.
-            </div>
-            <a onClick={openInNewTab}>Abrir PDF</a>
-          </div>
+          ) : pdfBlobUrl ? (
+            // Em iOS Safari, blob URL com type=application/pdf renderiza dentro de iframe
+            <iframe
+              src={pdfBlobUrl}
+              title={name || "PDF"}
+              style={{width:"100%", height:"100%", border:0, background:"white"}}
+            />
+          ) : (
+            <div className="pdf-fallback">Carregando PDF…</div>
+          )
         ) : (
           <img src={dataUrl} alt={name || "anexo"} />
         )}
