@@ -1,5 +1,10 @@
 const { useState, useEffect, useCallback, useRef } = React;
 
+// ─── Build flags ─────────────────────────────────────────────────────────
+const IS_BETA = true;
+const APP_VERSION_BASE = "1.2.1";
+const APP_VERSION = IS_BETA ? `${APP_VERSION_BASE}-beta` : APP_VERSION_BASE;
+
 // ─── Constants ───────────────────────────────────────────────────────────
 const CATEGORIES = [
   "Alm.cant.cliente s/iva","Almoço internacional","Almoço viagem - brasil",
@@ -70,7 +75,7 @@ function todayISO() {
 
 // ─── IndexedDB helpers ──────────────────────────────────────────────────
 const DB_NAME = "despesas_dinnero";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -82,6 +87,9 @@ function openDB() {
       }
       if (!db.objectStoreNames.contains("config")) {
         db.createObjectStore("config", { keyPath: "key" });
+      }
+      if (!db.objectStoreNames.contains("debug_log")) {
+        db.createObjectStore("debug_log", { keyPath: "id", autoIncrement: true });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -133,6 +141,104 @@ async function dbGet(store, key) {
   });
 }
 
+// ─── Debug log (Beta) ───────────────────────────────────────────────────
+const LOG_MAX_ENTRIES = 100;
+const LOG_MAX_BYTES = 500 * 1024; // 500 KB
+
+async function dbGetAllLogs() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("debug_log", "readonly");
+    const req = tx.objectStore("debug_log").getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbClearLogs() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("debug_log", "readwrite");
+    tx.objectStore("debug_log").clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function dbAddLogEntry(entry) {
+  try {
+    const db = await openDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction("debug_log", "readwrite");
+      tx.objectStore("debug_log").add(entry);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    // Aplica FIFO: corta entradas mais antigas se passar dos limites
+    const all = await dbGetAllLogs();
+    const totalBytes = all.reduce((s, e) => s + (JSON.stringify(e).length), 0);
+    if (all.length > LOG_MAX_ENTRIES || totalBytes > LOG_MAX_BYTES) {
+      const sorted = all.sort((a, b) => a.id - b.id);
+      // Quantos remover?
+      let toRemove = Math.max(0, all.length - LOG_MAX_ENTRIES);
+      if (totalBytes > LOG_MAX_BYTES) {
+        let acc = totalBytes;
+        for (const e of sorted) {
+          if (acc <= LOG_MAX_BYTES && all.length - toRemove <= LOG_MAX_ENTRIES) break;
+          acc -= JSON.stringify(e).length;
+          toRemove++;
+        }
+      }
+      const ids = sorted.slice(0, toRemove).map(e => e.id);
+      const db2 = await openDB();
+      await new Promise((resolve) => {
+        const tx = db2.transaction("debug_log", "readwrite");
+        const store = tx.objectStore("debug_log");
+        ids.forEach(id => store.delete(id));
+        tx.oncomplete = () => resolve();
+      });
+    }
+  } catch (err) {
+    // Falha silenciosa pra não criar loop infinito de log
+    if (typeof console !== "undefined") console.warn("logEvent failed:", err);
+  }
+}
+
+// API pública: logEvent(type, message, context?)
+function logEvent(type, message, context) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    version: APP_VERSION,
+    type,
+    message: String(message || ""),
+    context: context || null,
+    user_agent: typeof navigator !== "undefined" ? navigator.userAgent : null,
+  };
+  // Best-effort: dispara em background, sem bloquear o caller
+  dbAddLogEntry(entry);
+}
+
+// Hook de erros de runtime (instala uma única vez)
+let _runtimeHandlersInstalled = false;
+function installRuntimeErrorHandlers() {
+  if (_runtimeHandlersInstalled || typeof window === "undefined") return;
+  _runtimeHandlersInstalled = true;
+  window.addEventListener("error", (ev) => {
+    logEvent("runtime_error", ev?.message || "window error", {
+      filename: ev?.filename || null,
+      lineno: ev?.lineno || null,
+      colno: ev?.colno || null,
+      stack: ev?.error?.stack ? String(ev.error.stack).slice(0, 1500) : null,
+    });
+  });
+  window.addEventListener("unhandledrejection", (ev) => {
+    const reason = ev?.reason;
+    logEvent("unhandled_rejection",
+      reason?.message ? String(reason.message) : String(reason),
+      { stack: reason?.stack ? String(reason.stack).slice(0, 1500) : null });
+  });
+}
+
 // ─── Gemini API (Fase 2) ────────────────────────────────────────────────
 // Documentação: https://ai.google.dev/gemini-api/docs
 // Modelo: gemini-2.5-flash | Free tier: 1500 req/dia
@@ -154,6 +260,9 @@ Retorne APENAS um JSON válido (sem markdown, sem comentários, sem texto antes 
   "cidade": string ou null,             // cidade onde a despesa ocorreu, se identificável
   "origem": string ou null,             // só para táxi/uber/passagem aérea: ponto de partida
   "destino": string ou null,            // só para táxi/uber/passagem aérea: ponto de chegada
+  "diarias_extraidas": number ou null,  // só para hospedagem: nº de diárias (inteiro). Calcule por checkin/checkout se necessário.
+  "placa_veiculo": string ou null,      // só para combustível: placa do veículo (ex: ABC1D23), se aparecer no cupom
+  "km_rodados": number ou null,         // só para km rodado: quantidade de km rodados (inteiro)
   "categoria_sugerida": string,         // exatamente uma das categorias da lista abaixo
   "justificativa_sugerida": string,     // texto curto seguindo as regras abaixo
   "confianca": number                   // 0 a 1, sua confiança média na extração
@@ -219,7 +328,10 @@ function safeParseJson(text) {
 async function geminiExtractFromImage(apiKey, fileDataUrl) {
   if (!apiKey) throw new Error("Chave Gemini não configurada");
   const parsed = parseDataUrl(fileDataUrl);
-  if (!parsed) throw new Error("Arquivo inválido");
+  if (!parsed) {
+    logEvent("file_read_error", "Arquivo inválido ao chamar Gemini", { dataUrl_prefix: String(fileDataUrl).slice(0, 60) });
+    throw new Error("Arquivo inválido");
+  }
 
   // Gemini aceita imagens (image/*) e PDFs (application/pdf) via inline_data
   const body = {
@@ -244,24 +356,48 @@ async function geminiExtractFromImage(apiKey, fileDataUrl) {
       body: JSON.stringify(body),
     });
   } catch (e) {
+    logEvent("gemini_error", "Falha de rede ao chamar Gemini", {
+      mime_type: parsed.mimeType,
+      data_size_bytes: parsed.data.length,
+      error: String(e?.message || e),
+    });
     throw new Error("Sem conexão com o Gemini");
   }
 
   if (!resp.ok) {
     let msg = `Gemini retornou ${resp.status}`;
+    let errBody = null;
     try {
-      const err = await resp.json();
-      if (err?.error?.message) msg = err.error.message;
+      errBody = await resp.json();
+      if (errBody?.error?.message) msg = errBody.error.message;
     } catch {}
+    logEvent("gemini_error", msg, {
+      status: resp.status,
+      mime_type: parsed.mimeType,
+      data_size_bytes: parsed.data.length,
+      response_body: errBody ? JSON.stringify(errBody).slice(0, 1000) : null,
+    });
     throw new Error(msg);
   }
 
   const json = await resp.json();
   const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
   const data = safeParseJson(text);
-  if (!data) throw new Error("Resposta da IA em formato inesperado");
+  if (!data) {
+    logEvent("parse_error", "JSON da resposta do Gemini não pôde ser parseado", {
+      mime_type: parsed.mimeType,
+      raw_response_excerpt: text ? String(text).slice(0, 500) : null,
+      finish_reason: json?.candidates?.[0]?.finishReason || null,
+    });
+    throw new Error("Resposta da IA em formato inesperado");
+  }
 
   // Normaliza
+  const numOrNull = (v) => {
+    if (v == null || v === "") return null;
+    const n = typeof v === "number" ? v : parseInt(v, 10);
+    return Number.isFinite(n) ? n : null;
+  };
   return {
     estabelecimento: data.estabelecimento || "",
     cnpj: data.cnpj || null,
@@ -271,6 +407,9 @@ async function geminiExtractFromImage(apiKey, fileDataUrl) {
     cidade: data.cidade || null,
     origem: data.origem || null,
     destino: data.destino || null,
+    diarias_extraidas: numOrNull(data.diarias_extraidas),
+    placa_veiculo: data.placa_veiculo ? String(data.placa_veiculo).toUpperCase().replace(/[^A-Z0-9]/g, "") : null,
+    km_rodados: numOrNull(data.km_rodados),
     categoria_sugerida: data.categoria_sugerida && CATEGORIES.includes(data.categoria_sugerida) ? data.categoria_sugerida : "",
     justificativa_sugerida: data.justificativa_sugerida || "",
     confianca: typeof data.confianca === "number" ? data.confianca : 0.5,
@@ -291,15 +430,21 @@ async function geminiTestKey(apiKey) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-  } catch {
+  } catch (e) {
+    logEvent("gemini_error", "Falha de rede no teste de chave", { error: String(e?.message || e) });
     throw new Error("Sem conexão com a internet");
   }
   if (!resp.ok) {
     let msg = `Erro ${resp.status}`;
+    let errBody = null;
     try {
-      const err = await resp.json();
-      if (err?.error?.message) msg = err.error.message;
+      errBody = await resp.json();
+      if (errBody?.error?.message) msg = errBody.error.message;
     } catch {}
+    logEvent("gemini_error", `Teste de chave falhou: ${msg}`, {
+      status: resp.status,
+      response_body: errBody ? JSON.stringify(errBody).slice(0, 500) : null,
+    });
     throw new Error(msg);
   }
   return true;
@@ -807,13 +952,17 @@ function App() {
 
   // Load data
   useEffect(() => {
+    if (IS_BETA) installRuntimeErrorHandlers();
     (async () => {
       try {
         const v = await dbGetAll("viagens");
         setTrips(v.sort((a, b) => (b.data_inicio || "").localeCompare(a.data_inicio || "")));
         const c = await dbGet("config", "user");
         if (c) setConfig(c);
-      } catch (e) { console.error(e); }
+      } catch (e) {
+        console.error(e);
+        logEvent("runtime_error", "Falha ao carregar dados iniciais", { error: String(e?.message || e) });
+      }
       setLoaded(true);
     })();
   }, []);
@@ -1287,6 +1436,10 @@ function CapturePage({ trip, config, onSave, onBack }) {
       if (r.cnpj) setCnpj(r.cnpj);
       if (r.categoria_sugerida) setCatSuggested(r.categoria_sugerida);
       if (r.justificativa_sugerida) setJustSuggested(r.justificativa_sugerida);
+      // Auto-preenche campos condicionais quando a IA extrair
+      if (r.diarias_extraidas != null) setDiarias(String(r.diarias_extraidas));
+      if (r.placa_veiculo) setPlaca(r.placa_veiculo);
+      if (r.km_rodados != null) setKm(String(r.km_rodados));
       setAiConfidence(r.confianca);
       setAiExtracted(true);
     } catch (e) {
@@ -1301,6 +1454,15 @@ function CapturePage({ trip, config, onSave, onBack }) {
     if (!file) return;
     const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name || "");
     const reader = new FileReader();
+    reader.onerror = () => {
+      logEvent("file_read_error", "FileReader falhou ao ler o arquivo", {
+        name: file.name || null,
+        type: file.type || null,
+        size: file.size || 0,
+        error: String(reader.error?.message || reader.error || "unknown"),
+      });
+      setAiError("Não consegui ler o arquivo. Tente outro.");
+    };
     reader.onload = () => {
       const dataUrl = reader.result;
       // Photo armazena dataUrl pra display + envio à IA + persistência
@@ -1736,6 +1898,9 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
       if (r.cnpj) setCnpj(r.cnpj);
       if (r.categoria_sugerida) setCatSuggested(r.categoria_sugerida);
       if (r.justificativa_sugerida) setJustSuggested(r.justificativa_sugerida);
+      if (r.diarias_extraidas != null) setDiarias(String(r.diarias_extraidas));
+      if (r.placa_veiculo) setPlaca(r.placa_veiculo);
+      if (r.km_rodados != null) setKm(String(r.km_rodados));
       setAiInfo({ confianca: r.confianca });
     } catch (e) {
       setAiError(e.message || "Falha ao re-extrair");
@@ -2089,6 +2254,84 @@ function SettingsPage({ config, onSave, onBack, showToast }) {
   const [showKey, setShowKey] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState(null); // {ok: bool, msg: string}
+  // Beta: log de debug
+  const [logEntries, setLogEntries] = useState([]);
+  const [logBytes, setLogBytes] = useState(0);
+  const [confirmClearLog, setConfirmClearLog] = useState(false);
+
+  const refreshLogStats = useCallback(async () => {
+    if (!IS_BETA) return;
+    try {
+      const all = await dbGetAllLogs();
+      setLogEntries(all);
+      setLogBytes(all.reduce((s, e) => s + JSON.stringify(e).length, 0));
+    } catch (e) {
+      console.error(e);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshLogStats();
+  }, [refreshLogStats]);
+
+  const buildLogPayload = () => ({
+    app: "Despesas to Dinnero",
+    version: APP_VERSION,
+    exported_at: new Date().toISOString(),
+    user_agent: navigator.userAgent,
+    entries_count: logEntries.length,
+    entries: logEntries.sort((a, b) => a.id - b.id),
+  });
+
+  const handleCopyLog = async () => {
+    try {
+      const text = JSON.stringify(buildLogPayload(), null, 2);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        // fallback antigo
+        const ta = document.createElement("textarea");
+        ta.value = text; document.body.appendChild(ta);
+        ta.select(); document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      showToast("Log copiado");
+    } catch (e) {
+      showToast("Falha ao copiar");
+      logEvent("runtime_error", "Falha ao copiar log", { error: String(e?.message || e) });
+    }
+  };
+
+  const handleExportLog = () => {
+    try {
+      const text = JSON.stringify(buildLogPayload(), null, 2);
+      const blob = new Blob([text], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      a.download = `despesas-dinnero-log-${ts}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      showToast("Arquivo de log gerado");
+    } catch (e) {
+      showToast("Falha ao exportar");
+      logEvent("runtime_error", "Falha ao exportar log", { error: String(e?.message || e) });
+    }
+  };
+
+  const handleClearLog = async () => {
+    try {
+      await dbClearLogs();
+      await refreshLogStats();
+      setConfirmClearLog(false);
+      showToast("Log limpo");
+    } catch (e) {
+      showToast("Falha ao limpar");
+    }
+  };
 
   const addPart = () => {
     const n = newPart.trim().toUpperCase();
@@ -2199,11 +2442,63 @@ function SettingsPage({ config, onSave, onBack, showToast }) {
         <button className="fab" onClick={handleSave}>
           {Icons.check} Salvar configurações
         </button>
+
+        {IS_BETA && (
+          <>
+            <div className="section-head">Debug & Log (beta)</div>
+            <div style={{ padding:"0 16px 8px", fontSize:12, color:"var(--text3)", lineHeight:1.45 }}>
+              Eventos registrados automaticamente para diagnóstico durante o desenvolvimento.
+              Capturamos: erros de extração da IA, erros de leitura de arquivo e erros de runtime.
+            </div>
+            <div style={{ padding:"0 16px 8px", display:"flex", alignItems:"center", gap:10 }}>
+              <span className="pill" style={{ background:"var(--bg4)", color:"var(--text2)" }}>
+                {logEntries.length} evento{logEntries.length !== 1 ? "s" : ""}
+              </span>
+              <span className="pill" style={{ background:"var(--bg4)", color:"var(--text2)" }}>
+                {logBytes < 1024 ? `${logBytes} B` : `${(logBytes/1024).toFixed(1)} KB`}
+              </span>
+              <button onClick={refreshLogStats} className="ai-action" style={{ borderColor:"var(--text3)", color:"var(--text2)", marginLeft:"auto" }}>
+                {Icons.refresh}
+              </button>
+            </div>
+            <div style={{ display:"flex", gap:8, padding:"0 16px 8px" }}>
+              <button className="fab secondary small" style={{ flex:1, margin:0 }}
+                onClick={handleCopyLog} disabled={logEntries.length === 0}>
+                Copiar
+              </button>
+              <button className="fab secondary small" style={{ flex:1, margin:0 }}
+                onClick={handleExportLog} disabled={logEntries.length === 0}>
+                {Icons.export} Exportar
+              </button>
+            </div>
+            <button className="fab small" style={{ background:"var(--danger-dim)", color:"var(--danger)" }}
+              onClick={() => setConfirmClearLog(true)} disabled={logEntries.length === 0}>
+              Limpar log
+            </button>
+          </>
+        )}
+
         <div style={{ padding:"24px 16px 8px", textAlign:"center", fontSize:11, color:"var(--text3)" }}>
-          Despesas to Dinnero · PWA v1.2.0
+          Despesas to Dinnero · PWA v{APP_VERSION}
         </div>
         <div className="safe-bottom" />
       </div>
+
+      {confirmClearLog && (
+        <div className="modal-overlay" onClick={() => setConfirmClearLog(false)}>
+          <div className="modal-sheet" onClick={e => e.stopPropagation()}>
+            <div className="modal-handle" />
+            <div className="confirm-box">
+              <p>Limpar todos os {logEntries.length} eventos do log?<br/>Esta ação não pode ser desfeita.</p>
+              <div className="confirm-btns">
+                <button className="cancel" onClick={() => setConfirmClearLog(false)}>Cancelar</button>
+                <button className="danger" onClick={handleClearLog}>Limpar</button>
+              </div>
+            </div>
+            <div className="safe-bottom" />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
