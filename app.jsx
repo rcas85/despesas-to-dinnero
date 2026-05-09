@@ -2,7 +2,7 @@ const { useState, useEffect, useCallback, useRef } = React;
 
 // ─── Build flags ─────────────────────────────────────────────────────────
 const IS_BETA = true;
-const APP_VERSION_BASE = "1.2.4";
+const APP_VERSION_BASE = "1.2.5";
 const APP_VERSION = IS_BETA ? `${APP_VERSION_BASE}-beta` : APP_VERSION_BASE;
 
 // ─── Constants ───────────────────────────────────────────────────────────
@@ -974,35 +974,42 @@ html, body, #root {
   display:flex; align-items:center; justify-content:center;
   padding: calc(56px + var(--safe-top)) 0 calc(20px + var(--safe-bottom));
 }
-.viewer-body.pdf {
-  padding: calc(56px + var(--safe-top)) 0 calc(20px + var(--safe-bottom));
-  align-items:stretch;
-  overflow:auto;
-}
-.viewer-body iframe, .viewer-body embed, .viewer-body object {
-  width:100%; height:100%; border:0; background:white;
-  /* Permite que gestos cheguem ao iframe nativo */
-  touch-action: auto;
-}
 .viewer-body .pdf-fallback {
   padding:32px 24px; text-align:center; color:var(--text2); font-size:14px;
   line-height:1.6; align-self:center; max-width:320px;
 }
 
-/* Image stage with zoom/pan */
+/* Image / PDF stage with zoom/pan */
 .img-stage {
-  width:100%; height:100%; overflow:hidden;
+  width:100%; height:100%; overflow:auto;
   display:flex; align-items:center; justify-content:center;
-  touch-action: none; /* Captura todos os gestos para nosso handler */
+  touch-action: none;
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none;
+  -webkit-overflow-scrolling: touch;
 }
 .img-stage img {
   max-width:100%; max-height:100%;
   display:block;
   transform-origin: center center;
   will-change: transform;
+  -webkit-user-drag: none;
+}
+
+/* PDF pages container (PDF.js render output) */
+.pdf-pages {
+  display:flex; flex-direction:column; align-items:center;
+  gap:8px; padding:8px;
+  transform-origin: center center;
+  will-change: transform;
+}
+.pdf-pages img {
+  max-width:100%; max-height:none;
+  width:auto; display:block;
+  background:white;
+  box-shadow:0 4px 16px rgba(0,0,0,0.4);
+  border-radius:4px;
   -webkit-user-drag: none;
 }
 
@@ -1042,33 +1049,59 @@ html, body, #root {
 .preview-tappable:active { opacity:0.85; }
 `;
 
-// ─── Attachment Viewer (Fase 2, v1.2.4) ────────────────────────────────
+// ─── PDF.js loader (Fase 2, v1.2.5) ────────────────────────────────────
+// Carrega PDF.js sob demanda via CDN. Cacheia a Promise para múltiplas chamadas.
+const PDFJS_VERSION = "4.0.379";
+const PDFJS_BASE = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDFJS_VERSION}`;
+let _pdfJsPromise = null;
+function loadPdfJs() {
+  if (typeof window !== "undefined" && window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+  if (_pdfJsPromise) return _pdfJsPromise;
+  _pdfJsPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = `${PDFJS_BASE}/pdf.min.js`;
+    script.onload = () => {
+      try {
+        if (window.pdfjsLib?.GlobalWorkerOptions) {
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = `${PDFJS_BASE}/pdf.worker.min.js`;
+        }
+        resolve(window.pdfjsLib);
+      } catch (e) {
+        reject(e);
+      }
+    };
+    script.onerror = () => {
+      _pdfJsPromise = null; // permite retry
+      reject(new Error("Falha ao carregar PDF.js do CDN"));
+    };
+    document.head.appendChild(script);
+  });
+  return _pdfJsPromise;
+}
+
+// ─── Attachment Viewer (Fase 2, v1.2.5) ────────────────────────────────
 // Visualizador full-screen para imagens e PDFs. Read-only.
-// - Imagens: zoom via pinça, double-tap, e botões + / − ; pan ao arrastar quando ampliada
-// - PDFs: iframe com blob URL, controles nativos do visualizador iOS de PDF
+// PDFs são renderizados via PDF.js (canvas) para zoom consistente com imagens.
 function AttachmentViewer({ attachment, onClose }) {
   if (!attachment) return null;
   const { type, dataUrl, name } = attachment;
   const isPdf = type === "pdf" || /^data:application\/pdf/.test(dataUrl || "");
-  const [pdfBlobUrl, setPdfBlobUrl] = useState(null);
-  const [pdfError, setPdfError] = useState(null);
 
-  // Zoom state para imagens
+  // PDF state
+  const [pdfPages, setPdfPages] = useState([]); // array de dataURLs (PNG) das páginas
+  const [pdfLoading, setPdfLoading] = useState(false);
+  const [pdfError, setPdfError] = useState(null);
+  const [pdfProgress, setPdfProgress] = useState(0); // 0..1
+
+  // Zoom state
   const [scale, setScale] = useState(1);
   const [tx, setTx] = useState(0);
   const [ty, setTy] = useState(0);
   const stageRef = useRef(null);
-  const imgRef = useRef(null);
-  // Refs internos (não causam re-render)
+  const contentRef = useRef(null); // <img> para imagem, <div> para PDF
   const gesture = useRef({
-    pinching: false,
-    startDist: 0,
-    startScale: 1,
-    panning: false,
-    startX: 0,
-    startY: 0,
-    startTx: 0,
-    startTy: 0,
+    pinching: false, startDist: 0, startScale: 1,
+    panning: false, startX: 0, startY: 0, startTx: 0, startTy: 0,
     lastTap: 0,
   });
 
@@ -1076,19 +1109,15 @@ function AttachmentViewer({ attachment, onClose }) {
   const MAX_SCALE = 5;
 
   const clampPan = (nextTx, nextTy, nextScale) => {
-    // Limita o pan pra imagem não sair completamente da tela
     const stage = stageRef.current;
-    const img = imgRef.current;
-    if (!stage || !img) return [nextTx, nextTy];
+    const content = contentRef.current;
+    if (!stage || !content) return [nextTx, nextTy];
     const sw = stage.clientWidth;
     const sh = stage.clientHeight;
-    const iw = img.naturalWidth || img.clientWidth;
-    const ih = img.naturalHeight || img.clientHeight;
-    if (!iw || !ih) return [nextTx, nextTy];
-    // Tamanho renderizado base: contain
-    const baseScale = Math.min(sw / iw, sh / ih);
-    const w = iw * baseScale * nextScale;
-    const h = ih * baseScale * nextScale;
+    const cw = content.offsetWidth || sw;
+    const ch = content.offsetHeight || sh;
+    const w = cw * nextScale;
+    const h = ch * nextScale;
     const maxX = Math.max(0, (w - sw) / 2);
     const maxY = Math.max(0, (h - sh) / 2);
     return [
@@ -1097,50 +1126,79 @@ function AttachmentViewer({ attachment, onClose }) {
     ];
   };
 
-  const applyScale = (nextScale, centerX, centerY) => {
+  const applyScale = (nextScale) => {
     const s = Math.max(MIN_SCALE, Math.min(MAX_SCALE, nextScale));
-    if (s === 1) {
-      setScale(1); setTx(0); setTy(0); return;
-    }
+    if (s === 1) { setScale(1); setTx(0); setTy(0); return; }
     setScale(s);
-    // recalcula clamp do pan atual
     const [cx, cy] = clampPan(tx, ty, s);
     setTx(cx); setTy(cy);
   };
 
-  // Fecha com Esc no desktop
+  // Esc fecha
   useEffect(() => {
     const onKey = (e) => { if (e.key === "Escape") onClose(); };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  // Converte data URL → Blob URL (Safari iOS renderiza PDFs em blob: muito melhor que em data:)
+  // Renderiza PDF via PDF.js
   useEffect(() => {
     if (!isPdf || !dataUrl) return;
-    let blobUrl = null;
-    try {
-      const m = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
-      if (!m) throw new Error("data URL inválida");
-      const byteString = atob(m[2]);
-      const bytes = new Uint8Array(byteString.length);
-      for (let i = 0; i < byteString.length; i++) bytes[i] = byteString.charCodeAt(i);
-      const blob = new Blob([bytes], { type: m[1] });
-      blobUrl = URL.createObjectURL(blob);
-      setPdfBlobUrl(blobUrl);
-    } catch (e) {
-      setPdfError(String(e?.message || e));
-      logEvent("runtime_error", "Falha ao converter PDF para blob URL", { error: String(e?.message || e) });
-    }
-    return () => {
-      if (blobUrl) URL.revokeObjectURL(blobUrl);
-    };
+    let cancelled = false;
+    (async () => {
+      setPdfLoading(true);
+      setPdfError(null);
+      setPdfProgress(0);
+      setPdfPages([]);
+      try {
+        const pdfjsLib = await loadPdfJs();
+        // data URL → Uint8Array
+        const m = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
+        if (!m) throw new Error("data URL inválida");
+        const byteString = atob(m[2]);
+        const bytes = new Uint8Array(byteString.length);
+        for (let i = 0; i < byteString.length; i++) bytes[i] = byteString.charCodeAt(i);
+
+        const loadingTask = pdfjsLib.getDocument({ data: bytes });
+        const pdf = await loadingTask.promise;
+        if (cancelled) return;
+
+        const totalPages = pdf.numPages;
+        const renderedPages = [];
+        // Resolução base: 1.5x da escala 1 = boa qualidade pra ler texto
+        const RENDER_SCALE = 1.6;
+
+        for (let i = 1; i <= totalPages; i++) {
+          if (cancelled) return;
+          const page = await pdf.getPage(i);
+          const viewport = page.getViewport({ scale: RENDER_SCALE });
+          const canvas = document.createElement("canvas");
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          const ctx = canvas.getContext("2d");
+          await page.render({ canvasContext: ctx, viewport }).promise;
+          if (cancelled) return;
+          renderedPages.push(canvas.toDataURL("image/png"));
+          setPdfProgress(i / totalPages);
+        }
+
+        if (!cancelled) {
+          setPdfPages(renderedPages);
+          setPdfLoading(false);
+        }
+      } catch (e) {
+        if (cancelled) return;
+        setPdfError(String(e?.message || e));
+        setPdfLoading(false);
+        logEvent("runtime_error", "Falha ao renderizar PDF via PDF.js", { error: String(e?.message || e) });
+      }
+    })();
+    return () => { cancelled = true; };
   }, [isPdf, dataUrl]);
 
-  // Touch handlers para imagem
+  // Touch handlers (idênticos para imagem e PDF)
   const onTouchStart = (e) => {
     if (e.touches.length === 2) {
-      // Pinch start
       e.preventDefault();
       const [t1, t2] = [e.touches[0], e.touches[1]];
       const dx = t1.clientX - t2.clientX;
@@ -1150,7 +1208,6 @@ function AttachmentViewer({ attachment, onClose }) {
       gesture.current.startDist = Math.hypot(dx, dy);
       gesture.current.startScale = scale;
     } else if (e.touches.length === 1 && scale > 1) {
-      // Pan start (só quando ampliada)
       const t = e.touches[0];
       gesture.current.panning = true;
       gesture.current.pinching = false;
@@ -1159,7 +1216,6 @@ function AttachmentViewer({ attachment, onClose }) {
       gesture.current.startTx = tx;
       gesture.current.startTy = ty;
     } else if (e.touches.length === 1) {
-      // Detecta double-tap pra alternar zoom
       const now = Date.now();
       if (now - gesture.current.lastTap < 300) {
         e.preventDefault();
@@ -1179,8 +1235,7 @@ function AttachmentViewer({ attachment, onClose }) {
       const dy = t1.clientY - t2.clientY;
       const dist = Math.hypot(dx, dy);
       const ratio = dist / (gesture.current.startDist || 1);
-      const next = gesture.current.startScale * ratio;
-      applyScale(next);
+      applyScale(gesture.current.startScale * ratio);
     } else if (gesture.current.panning && e.touches.length === 1) {
       e.preventDefault();
       const t = e.touches[0];
@@ -1200,15 +1255,23 @@ function AttachmentViewer({ attachment, onClose }) {
   const zoomOut = () => applyScale(scale - 0.5);
   const zoomReset = () => applyScale(1);
 
+  const transformStyle = {
+    transform: `translate(${tx}px, ${ty}px) scale(${scale})`,
+    transition: gesture.current.pinching || gesture.current.panning ? "none" : "transform 0.18s ease-out",
+  };
+
   return (
     <div className="viewer-overlay">
       <div className="viewer-header">
-        <span className="v-title">{name || (isPdf ? "documento.pdf" : "imagem")}</span>
+        <span className="v-title">
+          {name || (isPdf ? "documento.pdf" : "imagem")}
+          {isPdf && pdfPages.length > 1 && ` · ${pdfPages.length} páginas`}
+        </span>
         <button className="v-close" onClick={onClose} aria-label="Fechar">
           {Icons.x}
         </button>
       </div>
-      <div className={`viewer-body ${isPdf ? "pdf" : ""}`}>
+      <div className="viewer-body">
         {isPdf ? (
           pdfError ? (
             <div className="pdf-fallback">
@@ -1217,14 +1280,31 @@ function AttachmentViewer({ attachment, onClose }) {
               </div>
               <div>Não consegui renderizar este PDF: {pdfError}</div>
             </div>
-          ) : pdfBlobUrl ? (
-            <iframe
-              src={pdfBlobUrl}
-              title={name || "PDF"}
-              style={{width:"100%", height:"100%", border:0, background:"white", touchAction:"auto"}}
-            />
+          ) : pdfLoading ? (
+            <div className="pdf-fallback">
+              <div className="spinner" style={{margin:"0 auto 12px", width:24, height:24, borderWidth:3, color:"var(--accent)"}} />
+              <div>Renderizando PDF…</div>
+              {pdfProgress > 0 && (
+                <div style={{marginTop:8, fontSize:12, color:"var(--text3)"}}>
+                  {Math.round(pdfProgress * 100)}%
+                </div>
+              )}
+            </div>
           ) : (
-            <div className="pdf-fallback">Carregando PDF…</div>
+            <div
+              ref={stageRef}
+              className="img-stage"
+              onTouchStart={onTouchStart}
+              onTouchMove={onTouchMove}
+              onTouchEnd={onTouchEnd}
+              onTouchCancel={onTouchEnd}
+            >
+              <div ref={contentRef} className="pdf-pages" style={transformStyle}>
+                {pdfPages.map((src, i) => (
+                  <img key={i} src={src} alt={`Página ${i+1}`} draggable={false} />
+                ))}
+              </div>
+            </div>
           )
         ) : (
           <div
@@ -1236,19 +1316,16 @@ function AttachmentViewer({ attachment, onClose }) {
             onTouchCancel={onTouchEnd}
           >
             <img
-              ref={imgRef}
+              ref={contentRef}
               src={dataUrl}
               alt={name || "anexo"}
               draggable={false}
-              style={{
-                transform: `translate(${tx}px, ${ty}px) scale(${scale})`,
-                transition: gesture.current.pinching || gesture.current.panning ? "none" : "transform 0.18s ease-out",
-              }}
+              style={transformStyle}
             />
           </div>
         )}
       </div>
-      {!isPdf && (
+      {(!isPdf || (!pdfLoading && !pdfError && pdfPages.length > 0)) && (
         <div className="viewer-controls">
           <button onClick={zoomOut} disabled={scale <= MIN_SCALE} aria-label="Diminuir zoom">−</button>
           <button onClick={zoomReset} disabled={scale === 1} aria-label="Resetar zoom">
