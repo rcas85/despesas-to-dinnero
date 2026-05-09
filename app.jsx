@@ -139,20 +139,24 @@ async function dbGet(store, key) {
 const GEMINI_MODEL = "gemini-2.5-flash";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
-const EXTRACTION_PROMPT_TEMPLATE = `Você é um assistente de extração de dados de notas fiscais e cupons fiscais brasileiros.
+const EXTRACTION_PROMPT_TEMPLATE = `Você é um assistente de extração de dados de notas fiscais, cupons fiscais e comprovantes brasileiros. A entrada pode ser uma imagem OU um PDF.
 
-Analise a imagem da NF/cupom fiscal/comprovante e extraia os dados em JSON.
+Analise o documento e extraia os dados em JSON.
 
 Retorne APENAS um JSON válido (sem markdown, sem comentários, sem texto antes ou depois) com os campos:
 
 {
-  "estabelecimento": string,        // razão social ou nome fantasia legível, sem CNPJ junto
-  "cnpj": string ou null,           // formato XX.XXX.XXX/XXXX-XX, ou null se ilegível
-  "valor_total": number,            // em reais, com 2 decimais, apenas o total final
-  "data_despesa": string,           // formato YYYY-MM-DD
-  "horario": string ou null,        // formato HH:MM, ou null se não houver
-  "categoria_sugerida": string,     // exatamente uma das categorias da lista abaixo
-  "confianca": number               // 0 a 1, sua confiança média na extração
+  "estabelecimento": string,            // razão social ou nome fantasia legível, sem CNPJ junto
+  "cnpj": string ou null,               // formato XX.XXX.XXX/XXXX-XX, ou null se ilegível
+  "valor_total": number,                // em reais, com 2 decimais, apenas o total final
+  "data_despesa": string,               // formato YYYY-MM-DD
+  "horario": string ou null,            // formato HH:MM, ou null se não houver
+  "cidade": string ou null,             // cidade onde a despesa ocorreu, se identificável
+  "origem": string ou null,             // só para táxi/uber/passagem aérea: ponto de partida
+  "destino": string ou null,            // só para táxi/uber/passagem aérea: ponto de chegada
+  "categoria_sugerida": string,         // exatamente uma das categorias da lista abaixo
+  "justificativa_sugerida": string,     // texto curto seguindo as regras abaixo
+  "confianca": number                   // 0 a 1, sua confiança média na extração
 }
 
 CATEGORIAS POSSÍVEIS (escolha exatamente uma, escrevendo idêntico):
@@ -171,7 +175,22 @@ HEURÍSTICAS PARA SUGERIR CATEGORIA:
 - Locadora de veículos (Localiza, Movida, Unidas) → "Aluguel de veículos em viagem"
 - Lava-jato, lava-rápido → "Lavação/higienização de veículos"
 
-Se não conseguir determinar com clareza, prefira deixar a categoria mais genérica de viagem ou retornar string vazia. Se algum campo for ilegível, retorne null nesse campo (mas o JSON precisa ser válido).`;
+REGRAS PARA "justificativa_sugerida" (texto curto, em letras minúsculas no início, sem ponto final, em português):
+- Almoço/Jantar/Café da manhã: "almoço em [estabelecimento][, cidade se houver]" / "jantar..." / "café da manhã..."
+- Hospedagem: "hospedagem em [hotel][, cidade]" — se identificar checkin/checkout, pode mencionar diárias
+- Combustível em viagem: "abastecimento em viagem[, cidade]"
+- Táxi/Uber: "deslocamento de [origem] para [destino]" — se não tiver origem/destino, "deslocamento em viagem[, cidade]"
+- Estacionamento/pedágio: "estacionamento em viagem[, cidade]" ou "pedágio em viagem"
+- Passagem aérea: "passagem aérea [origem] → [destino][, data]"
+- Aluguel de veículos: "aluguel de veículo em viagem[, cidade]"
+- Fee de agência: "fee"
+- Outros casos: descrição curta e factual ("compra de [item] em viagem")
+
+Se não conseguir determinar com clareza:
+- categoria_sugerida: prefira a categoria mais genérica de viagem ou string vazia
+- justificativa_sugerida: gere algo plausível baseado no que conseguiu ler, ou string vazia
+
+Se algum campo for ilegível, retorne null nesse campo (mas o JSON precisa ser válido).`;
 
 function buildExtractionPrompt() {
   return EXTRACTION_PROMPT_TEMPLATE.replace("__CATEGORIES__", CATEGORIES.map(c => `- ${c}`).join("\n"));
@@ -197,11 +216,12 @@ function safeParseJson(text) {
   try { return JSON.parse(t); } catch { return null; }
 }
 
-async function geminiExtractFromImage(apiKey, photoDataUrl) {
+async function geminiExtractFromImage(apiKey, fileDataUrl) {
   if (!apiKey) throw new Error("Chave Gemini não configurada");
-  const parsed = parseDataUrl(photoDataUrl);
-  if (!parsed) throw new Error("Imagem inválida");
+  const parsed = parseDataUrl(fileDataUrl);
+  if (!parsed) throw new Error("Arquivo inválido");
 
+  // Gemini aceita imagens (image/*) e PDFs (application/pdf) via inline_data
   const body = {
     contents: [{
       parts: [
@@ -248,7 +268,11 @@ async function geminiExtractFromImage(apiKey, photoDataUrl) {
     valor_total: typeof data.valor_total === "number" ? data.valor_total : parseFloat(data.valor_total) || 0,
     data_despesa: data.data_despesa || todayISO(),
     horario: data.horario || null,
+    cidade: data.cidade || null,
+    origem: data.origem || null,
+    destino: data.destino || null,
     categoria_sugerida: data.categoria_sugerida && CATEGORIES.includes(data.categoria_sugerida) ? data.categoria_sugerida : "",
+    justificativa_sugerida: data.justificativa_sugerida || "",
     confianca: typeof data.confianca === "number" ? data.confianca : 0.5,
   };
 }
@@ -342,6 +366,9 @@ const Icons = {
   ),
   alert: (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+  ),
+  fileText: (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
   ),
 };
 
@@ -731,6 +758,41 @@ html, body, #root {
 .test-result { font-size:12px; flex:1; }
 .test-result.ok { color:var(--accent); }
 .test-result.bad { color:var(--danger); }
+
+/* PDF preview card (Fase 2) */
+.pdf-card {
+  display:flex; align-items:center; gap:12px;
+  margin:8px 16px 16px; padding:18px 16px;
+  background:var(--bg2); border:1px solid var(--border);
+  border-radius:var(--radius);
+}
+.pdf-card .pdf-icon {
+  width:44px; height:44px; border-radius:10px;
+  background:var(--blue-dim); color:var(--blue);
+  display:flex; align-items:center; justify-content:center;
+  flex-shrink:0;
+}
+.pdf-card .pdf-body { flex:1; min-width:0; }
+.pdf-card .pdf-name {
+  font-size:14px; font-weight:500;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.pdf-card .pdf-sub { font-size:12px; color:var(--text3); margin-top:2px; }
+
+/* Dual capture buttons (Foto / PDF) */
+.capture-buttons {
+  display:flex; gap:8px; margin:8px 16px 12px;
+}
+.capture-buttons .cap-btn {
+  flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:6px; padding:14px 8px; border-radius:var(--radius);
+  background:var(--bg2); border:1px dashed var(--border2);
+  color:var(--text2); cursor:pointer; transition:all 0.15s;
+  font-family:var(--font); font-size:12px; font-weight:500;
+}
+.capture-buttons .cap-btn:active { background:var(--bg3); border-color:var(--accent); color:var(--accent); }
+.capture-buttons .cap-btn .cap-icon { color:var(--text3); }
+.capture-buttons .cap-btn:active .cap-icon { color:var(--accent); }
 `;
 
 // ─── Main App ────────────────────────────────────────────────────────────
@@ -1140,11 +1202,16 @@ function ExpenseCard({ expense, onClick }) {
   const isMeal = MEAL_CATEGORIES.includes(d.categoria_dinnero);
   const isReviewed = d.status_revisao === "revisado";
   const hasPhoto = !!d.captura?.foto_thumbnail_base64;
+  const isPdf = d.captura?.anexo_tipo === "pdf" || d.captura?.foto_thumbnail_base64?.startsWith("data:application/pdf");
 
   return (
     <div className="card" onClick={onClick} style={{ cursor:"pointer" }}>
       <div className="card-row">
-        {hasPhoto ? (
+        {isPdf ? (
+          <div className="card-icon" style={{ background:"var(--blue-dim)", color:"var(--blue)" }}>
+            {Icons.fileText}
+          </div>
+        ) : hasPhoto ? (
           <img src={d.captura.foto_thumbnail_base64} alt="" style={{ width:44, height:44, borderRadius:10, objectFit:"cover", flexShrink:0 }} />
         ) : (
           <div className="card-icon" style={{ background:"var(--bg4)", color:"var(--text3)" }}>
@@ -1189,9 +1256,13 @@ function CapturePage({ trip, config, onSave, onBack }) {
   const [aiExtracted, setAiExtracted] = useState(false);
   const [aiConfidence, setAiConfidence] = useState(null);
   const [catSuggested, setCatSuggested] = useState("");
+  const [justSuggested, setJustSuggested] = useState("");
   const [horario, setHorario] = useState(null);
   const [cnpj, setCnpj] = useState(null);
+  // Fase 2: anexo (imagem ou PDF)
+  const [attachment, setAttachment] = useState(null); // {type: 'image'|'pdf', dataUrl, name, size}
   const fileRef = useRef(null);
+  const pdfRef = useRef(null);
 
   const hasKey = !!(config.gemini_api_key && config.gemini_api_key.trim());
   const isMeal = MEAL_CATEGORIES.includes(cat);
@@ -1206,6 +1277,7 @@ function CapturePage({ trip, config, onSave, onBack }) {
     setAiError(null);
     setAiExtracted(false);
     setCatSuggested("");
+    setJustSuggested("");
     try {
       const r = await geminiExtractFromImage(config.gemini_api_key.trim(), dataUrl);
       if (r.estabelecimento) setEstab(r.estabelecimento);
@@ -1214,6 +1286,7 @@ function CapturePage({ trip, config, onSave, onBack }) {
       if (r.horario) setHorario(r.horario);
       if (r.cnpj) setCnpj(r.cnpj);
       if (r.categoria_sugerida) setCatSuggested(r.categoria_sugerida);
+      if (r.justificativa_sugerida) setJustSuggested(r.justificativa_sugerida);
       setAiConfidence(r.confianca);
       setAiExtracted(true);
     } catch (e) {
@@ -1223,15 +1296,22 @@ function CapturePage({ trip, config, onSave, onBack }) {
     }
   };
 
-  const handlePhoto = (e) => {
-    const file = e.target.files?.[0];
+  // Aceita File (image/* ou application/pdf) e dispara extração
+  const handleFile = (file) => {
     if (!file) return;
+    const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name || "");
     const reader = new FileReader();
     reader.onload = () => {
       const dataUrl = reader.result;
+      // Photo armazena dataUrl pra display + envio à IA + persistência
       setPhoto(dataUrl);
+      setAttachment({
+        type: isPdf ? "pdf" : "image",
+        dataUrl,
+        name: file.name || (isPdf ? "documento.pdf" : "foto.jpg"),
+        size: file.size || 0,
+      });
       setStep(1);
-      // Dispara extração se houver chave + internet
       if (hasKey && navigator.onLine) {
         runExtraction(dataUrl);
       } else if (!hasKey) {
@@ -1243,14 +1323,20 @@ function CapturePage({ trip, config, onSave, onBack }) {
     reader.readAsDataURL(file);
   };
 
+  const handlePhoto = (e) => handleFile(e.target.files?.[0]);
+  const handlePdf = (e) => handleFile(e.target.files?.[0]);
+
   const handleSave = () => {
     const valNum = parseFloat(valor.replace(",", ".")) || 0;
+    const ext = attachment?.type === "pdf" ? "pdf" : "jpg";
     const expense = {
       despesa_id: uuid(),
       captura: {
         timestamp_captura: new Date().toISOString(),
-        foto_path: `fotos/despesa_${uuid().slice(0,8)}_nf.jpg`,
+        foto_path: `fotos/despesa_${uuid().slice(0,8)}_nf.${ext}`,
         foto_thumbnail_base64: photo,
+        anexo_tipo: attachment?.type || (photo ? "image" : null),
+        anexo_nome_original: attachment?.name || null,
       },
       dados_nf: {
         estabelecimento: estab.trim() || "Sem nome",
@@ -1314,20 +1400,41 @@ function CapturePage({ trip, config, onSave, onBack }) {
       <div className="scroll">
         {step === 0 && (
           <>
-            <div className="section-head">Foto da nota fiscal</div>
-            <div className="photo-area" onClick={() => fileRef.current?.click()}>
-              {photo ? (
+            <div className="section-head">Anexo da despesa</div>
+
+            {attachment?.type === "pdf" ? (
+              <div className="pdf-card">
+                <div className="pdf-icon">{Icons.fileText}</div>
+                <div className="pdf-body">
+                  <div className="pdf-name">{attachment.name}</div>
+                  <div className="pdf-sub">PDF · {attachment.size ? `${(attachment.size/1024).toFixed(0)} KB` : "anexado"}</div>
+                </div>
+                <button className="ai-action" style={{borderColor:"var(--text3)", color:"var(--text2)"}} onClick={() => { setAttachment(null); setPhoto(null); }}>
+                  Trocar
+                </button>
+              </div>
+            ) : photo ? (
+              <div className="photo-area" onClick={() => fileRef.current?.click()}>
                 <img src={photo} alt="NF" />
-              ) : (
-                <>
-                  <div style={{ color:"var(--text3)" }}>{Icons.camera}</div>
-                  <div className="photo-label">Toque para capturar ou escolher da galeria</div>
-                </>
-              )}
-            </div>
+              </div>
+            ) : (
+              <div className="capture-buttons">
+                <button className="cap-btn" onClick={() => fileRef.current?.click()}>
+                  <span className="cap-icon">{Icons.camera}</span>
+                  <span>Tirar foto / galeria</span>
+                </button>
+                <button className="cap-btn" onClick={() => pdfRef.current?.click()}>
+                  <span className="cap-icon">{Icons.fileText}</span>
+                  <span>Anexar PDF</span>
+                </button>
+              </div>
+            )}
+
             <input ref={fileRef} type="file" accept="image/*" capture="environment" onChange={handlePhoto} style={{ display:"none" }} />
+            <input ref={pdfRef} type="file" accept="application/pdf,.pdf" onChange={handlePdf} style={{ display:"none" }} />
+
             <button className="fab secondary" onClick={() => setStep(1)}>
-              Pular foto (preencher manualmente)
+              Pular anexo (preencher manualmente)
             </button>
           </>
         )}
@@ -1335,7 +1442,15 @@ function CapturePage({ trip, config, onSave, onBack }) {
         {step === 1 && (
           <>
             <div className="section-head">Dados da despesa</div>
-            {photo && (
+            {attachment?.type === "pdf" ? (
+              <div className="pdf-card" style={{margin:"0 16px 12px"}}>
+                <div className="pdf-icon">{Icons.fileText}</div>
+                <div className="pdf-body">
+                  <div className="pdf-name">{attachment.name}</div>
+                  <div className="pdf-sub">PDF · {attachment.size ? `${(attachment.size/1024).toFixed(0)} KB` : "anexado"}</div>
+                </div>
+              </div>
+            ) : photo && (
               <div style={{ margin:"0 16px 12px", borderRadius:12, overflow:"hidden", height:120 }}>
                 <img src={photo} alt="NF" style={{ width:"100%", height:"100%", objectFit:"cover" }} />
               </div>
@@ -1498,6 +1613,16 @@ function CapturePage({ trip, config, onSave, onBack }) {
             )}
 
             {/* Justificativa */}
+            {justSuggested && justSuggested !== justificativa && (
+              <div className="suggest-cat" style={{marginBottom:0}}>
+                <span style={{display:"flex"}}>{Icons.sparkle}</span>
+                <span>Sugerimos: <strong>{justSuggested}</strong></span>
+                <button className="ai-action" style={{borderColor:"var(--accent)", color:"var(--accent)"}} onClick={() => setJust(justSuggested)}>
+                  Aplicar
+                </button>
+                <button className="sc-x" onClick={() => setJustSuggested("")} aria-label="Dispensar">{Icons.x}</button>
+              </div>
+            )}
             <div className="field" style={{ marginTop:8 }}>
               <label>Justificativa</label>
               <textarea
@@ -1542,6 +1667,10 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
   const [catSuggested, setCatSuggested] = useState("");
   const [horario, setHorario] = useState(expense.dados_nf?.horario || null);
   const [cnpj, setCnpj] = useState(expense.dados_nf?.cnpj || null);
+  const [justSuggested, setJustSuggested] = useState("");
+  // Anexo: detecta tipo a partir dos metadados salvos
+  const attachmentType = expense.captura?.anexo_tipo || (expense.captura?.foto_thumbnail_base64?.startsWith("data:application/pdf") ? "pdf" : "image");
+  const attachmentName = expense.captura?.anexo_nome_original || null;
   const photo = expense.captura?.foto_thumbnail_base64;
 
   const hasKey = !!(config.gemini_api_key && config.gemini_api_key.trim());
@@ -1597,6 +1726,7 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
     if (!photo || !hasKey) return;
     setAiLoading(true);
     setAiError(null);
+    setJustSuggested("");
     try {
       const r = await geminiExtractFromImage(config.gemini_api_key.trim(), photo);
       if (r.estabelecimento) setEstab(r.estabelecimento);
@@ -1605,6 +1735,7 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
       if (r.horario) setHorario(r.horario);
       if (r.cnpj) setCnpj(r.cnpj);
       if (r.categoria_sugerida) setCatSuggested(r.categoria_sugerida);
+      if (r.justificativa_sugerida) setJustSuggested(r.justificativa_sugerida);
       setAiInfo({ confianca: r.confianca });
     } catch (e) {
       setAiError(e.message || "Falha ao re-extrair");
@@ -1622,7 +1753,15 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
       </div>
 
       <div className="scroll">
-        {photo && (
+        {photo && attachmentType === "pdf" ? (
+          <div className="pdf-card" style={{margin:"12px 16px 0"}}>
+            <div className="pdf-icon">{Icons.fileText}</div>
+            <div className="pdf-body">
+              <div className="pdf-name">{attachmentName || "documento.pdf"}</div>
+              <div className="pdf-sub">PDF anexado</div>
+            </div>
+          </div>
+        ) : photo && (
           <div style={{ margin:"12px 16px 0", borderRadius:12, overflow:"hidden", height:140 }}>
             <img src={photo} alt="NF" style={{ width:"100%", height:"100%", objectFit:"cover" }} />
           </div>
@@ -1766,6 +1905,17 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
               </div>
             )}
           </>
+        )}
+
+        {justSuggested && justSuggested !== justificativa && (
+          <div className="suggest-cat" style={{marginTop:8, marginBottom:0}}>
+            <span style={{display:"flex"}}>{Icons.sparkle}</span>
+            <span>Sugerimos: <strong>{justSuggested}</strong></span>
+            <button className="ai-action" style={{borderColor:"var(--accent)", color:"var(--accent)"}} onClick={() => setJust(justSuggested)}>
+              Aplicar
+            </button>
+            <button className="sc-x" onClick={() => setJustSuggested("")} aria-label="Dispensar">{Icons.x}</button>
+          </div>
         )}
 
         <div className="field" style={{ marginTop:8 }}>
@@ -2050,7 +2200,7 @@ function SettingsPage({ config, onSave, onBack, showToast }) {
           {Icons.check} Salvar configurações
         </button>
         <div style={{ padding:"24px 16px 8px", textAlign:"center", fontSize:11, color:"var(--text3)" }}>
-          Despesas to Dinnero · PWA v1.1.0
+          Despesas to Dinnero · PWA v1.2.0
         </div>
         <div className="safe-bottom" />
       </div>
