@@ -2,7 +2,7 @@ const { useState, useEffect, useCallback, useRef } = React;
 
 // ─── Build flags ─────────────────────────────────────────────────────────
 const IS_BETA = true;
-const APP_VERSION_BASE = "1.2.5";
+const APP_VERSION_BASE = "1.2.6";
 const APP_VERSION = IS_BETA ? `${APP_VERSION_BASE}-beta` : APP_VERSION_BASE;
 
 // ─── Constants ───────────────────────────────────────────────────────────
@@ -976,8 +976,15 @@ html, body, #root {
 }
 .viewer-body .pdf-fallback {
   padding:32px 24px; text-align:center; color:var(--text2); font-size:14px;
-  line-height:1.6; align-self:center; max-width:320px;
+  line-height:1.6; align-self:center; max-width:340px;
 }
+.viewer-body .pdf-fallback a {
+  color:var(--accent); text-decoration:none; font-weight:600;
+  display:inline-block; margin-top:14px;
+  padding:10px 20px; border:1px solid var(--accent);
+  border-radius:var(--radius-sm); cursor:pointer;
+}
+.viewer-body .pdf-fallback a:active { background:var(--accent-dim); }
 
 /* Image / PDF stage with zoom/pan */
 .img-stage {
@@ -1049,30 +1056,66 @@ html, body, #root {
 .preview-tappable:active { opacity:0.85; }
 `;
 
-// ─── PDF.js loader (Fase 2, v1.2.5) ────────────────────────────────────
-// Carrega PDF.js sob demanda via CDN. Cacheia a Promise para múltiplas chamadas.
-const PDFJS_VERSION = "4.0.379";
-const PDFJS_BASE = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDFJS_VERSION}`;
+// ─── PDF.js loader (Fase 2, v1.2.6) ────────────────────────────────────
+// PDF.js servido localmente em /vendor/pdfjs/ (vendorizado no repo).
+// Decisão arquitetural: CDN externa (cdnjs/unpkg/jsdelivr) mostrou-se SPOF
+// em iOS Safari standalone — o pdf.min.js da v4 nem existe (só .mjs) e o
+// CSP/SW da PWA pode bloquear domínios externos. Vendorizamos a v3.11.174
+// (último release com build clássico .js) no próprio repo.
+const PDFJS_VERSION = "3.11.174";
+const PDFJS_SCRIPT = "/vendor/pdfjs/pdf.min.js";
+const PDFJS_WORKER = "/vendor/pdfjs/pdf.worker.min.js";
 let _pdfJsPromise = null;
+
+async function probeUrl(url) {
+  // HEAD pra capturar status sem baixar o conteúdo. Usado só pra log de erro.
+  try {
+    const r = await fetch(url, { method: "HEAD" });
+    return { ok: r.ok, status: r.status, statusText: r.statusText };
+  } catch (e) {
+    return { ok: false, status: 0, statusText: String(e?.message || e) };
+  }
+}
+
 function loadPdfJs() {
   if (typeof window !== "undefined" && window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
   if (_pdfJsPromise) return _pdfJsPromise;
   _pdfJsPromise = new Promise((resolve, reject) => {
     const script = document.createElement("script");
-    script.src = `${PDFJS_BASE}/pdf.min.js`;
+    script.src = PDFJS_SCRIPT;
+    script.async = true;
     script.onload = () => {
       try {
-        if (window.pdfjsLib?.GlobalWorkerOptions) {
-          window.pdfjsLib.GlobalWorkerOptions.workerSrc = `${PDFJS_BASE}/pdf.worker.min.js`;
+        if (!window.pdfjsLib) {
+          throw new Error("pdf.min.js carregou mas window.pdfjsLib não existe");
+        }
+        if (window.pdfjsLib.GlobalWorkerOptions) {
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
         }
         resolve(window.pdfjsLib);
       } catch (e) {
+        _pdfJsPromise = null;
         reject(e);
       }
     };
-    script.onerror = () => {
-      _pdfJsPromise = null; // permite retry
-      reject(new Error("Falha ao carregar PDF.js do CDN"));
+    script.onerror = async () => {
+      _pdfJsPromise = null;
+      // Loga contexto rico antes de rejeitar — fundamental pra diagnóstico
+      const probe = await probeUrl(PDFJS_SCRIPT);
+      const swActive = typeof navigator !== "undefined" && !!navigator.serviceWorker?.controller;
+      logEvent("runtime_error", "Falha ao carregar PDF.js local", {
+        script_url: PDFJS_SCRIPT,
+        worker_url: PDFJS_WORKER,
+        probe_status: probe.status,
+        probe_status_text: probe.statusText,
+        service_worker_active: swActive,
+        location_origin: typeof location !== "undefined" ? location.origin : null,
+      });
+      reject(new Error(
+        probe.status === 404
+          ? `PDF.js não encontrado em ${PDFJS_SCRIPT} (HTTP 404). Vendorize os arquivos no repo.`
+          : `Falha ao carregar PDF.js (status ${probe.status || "?"})`
+      ));
     };
     document.head.appendChild(script);
   });
@@ -1165,7 +1208,7 @@ function AttachmentViewer({ attachment, onClose }) {
 
         const totalPages = pdf.numPages;
         const renderedPages = [];
-        // Resolução base: 1.5x da escala 1 = boa qualidade pra ler texto
+        // Resolução base: 1.6x da escala 1 = boa qualidade pra ler texto
         const RENDER_SCALE = 1.6;
 
         for (let i = 1; i <= totalPages; i++) {
@@ -1195,6 +1238,28 @@ function AttachmentViewer({ attachment, onClose }) {
     })();
     return () => { cancelled = true; };
   }, [isPdf, dataUrl]);
+
+  // Fallback: baixar o PDF original
+  const downloadOriginalPdf = () => {
+    try {
+      const m = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
+      if (!m) throw new Error("data URL inválida");
+      const byteString = atob(m[2]);
+      const bytes = new Uint8Array(byteString.length);
+      for (let i = 0; i < byteString.length; i++) bytes[i] = byteString.charCodeAt(i);
+      const blob = new Blob([bytes], { type: m[1] });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name || "documento.pdf";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    } catch (e) {
+      logEvent("runtime_error", "Falha ao baixar PDF original", { error: String(e?.message || e) });
+    }
+  };
 
   // Touch handlers (idênticos para imagem e PDF)
   const onTouchStart = (e) => {
@@ -1278,7 +1343,8 @@ function AttachmentViewer({ attachment, onClose }) {
               <div style={{fontSize:16, color:"var(--text)", fontWeight:500, marginBottom:8}}>
                 📄 {name || "documento.pdf"}
               </div>
-              <div>Não consegui renderizar este PDF: {pdfError}</div>
+              <div style={{marginBottom:14}}>Não consegui renderizar o PDF dentro do app:<br/><span style={{color:"var(--text3)", fontSize:12}}>{pdfError}</span></div>
+              <a onClick={downloadOriginalPdf}>Baixar PDF original</a>
             </div>
           ) : pdfLoading ? (
             <div className="pdf-fallback">
