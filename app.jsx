@@ -2,7 +2,7 @@ const { useState, useEffect, useCallback, useRef } = React;
 
 // ─── Build flags ─────────────────────────────────────────────────────────
 const IS_BETA = true;
-const APP_VERSION_BASE = "1.2.6";
+const APP_VERSION_BASE = "1.2.7";
 const APP_VERSION = IS_BETA ? `${APP_VERSION_BASE}-beta` : APP_VERSION_BASE;
 
 // ─── Constants ───────────────────────────────────────────────────────────
@@ -974,49 +974,21 @@ html, body, #root {
   display:flex; align-items:center; justify-content:center;
   padding: calc(56px + var(--safe-top)) 0 calc(20px + var(--safe-bottom));
 }
-.viewer-body .pdf-fallback {
-  padding:32px 24px; text-align:center; color:var(--text2); font-size:14px;
-  line-height:1.6; align-self:center; max-width:340px;
-}
-.viewer-body .pdf-fallback a {
-  color:var(--accent); text-decoration:none; font-weight:600;
-  display:inline-block; margin-top:14px;
-  padding:10px 20px; border:1px solid var(--accent);
-  border-radius:var(--radius-sm); cursor:pointer;
-}
-.viewer-body .pdf-fallback a:active { background:var(--accent-dim); }
 
-/* Image / PDF stage with zoom/pan */
+/* Image stage with zoom/pan */
 .img-stage {
-  width:100%; height:100%; overflow:auto;
+  width:100%; height:100%; overflow:hidden;
   display:flex; align-items:center; justify-content:center;
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none;
-  -webkit-overflow-scrolling: touch;
 }
 .img-stage img {
   max-width:100%; max-height:100%;
   display:block;
   transform-origin: center center;
   will-change: transform;
-  -webkit-user-drag: none;
-}
-
-/* PDF pages container (PDF.js render output) */
-.pdf-pages {
-  display:flex; flex-direction:column; align-items:center;
-  gap:8px; padding:8px;
-  transform-origin: center center;
-  will-change: transform;
-}
-.pdf-pages img {
-  max-width:100%; max-height:none;
-  width:auto; display:block;
-  background:white;
-  box-shadow:0 4px 16px rgba(0,0,0,0.4);
-  border-radius:4px;
   -webkit-user-drag: none;
 }
 
@@ -1056,92 +1028,19 @@ html, body, #root {
 .preview-tappable:active { opacity:0.85; }
 `;
 
-// ─── PDF.js loader (Fase 2, v1.2.6) ────────────────────────────────────
-// PDF.js servido localmente em /vendor/pdfjs/ (vendorizado no repo).
-// Decisão arquitetural: CDN externa (cdnjs/unpkg/jsdelivr) mostrou-se SPOF
-// em iOS Safari standalone — o pdf.min.js da v4 nem existe (só .mjs) e o
-// CSP/SW da PWA pode bloquear domínios externos. Vendorizamos a v3.11.174
-// (último release com build clássico .js) no próprio repo.
-const PDFJS_VERSION = "3.11.174";
-const PDFJS_SCRIPT = "/vendor/pdfjs/pdf.min.js";
-const PDFJS_WORKER = "/vendor/pdfjs/pdf.worker.min.js";
-let _pdfJsPromise = null;
-
-async function probeUrl(url) {
-  // HEAD pra capturar status sem baixar o conteúdo. Usado só pra log de erro.
-  try {
-    const r = await fetch(url, { method: "HEAD" });
-    return { ok: r.ok, status: r.status, statusText: r.statusText };
-  } catch (e) {
-    return { ok: false, status: 0, statusText: String(e?.message || e) };
-  }
-}
-
-function loadPdfJs() {
-  if (typeof window !== "undefined" && window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
-  if (_pdfJsPromise) return _pdfJsPromise;
-  _pdfJsPromise = new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = PDFJS_SCRIPT;
-    script.async = true;
-    script.onload = () => {
-      try {
-        if (!window.pdfjsLib) {
-          throw new Error("pdf.min.js carregou mas window.pdfjsLib não existe");
-        }
-        if (window.pdfjsLib.GlobalWorkerOptions) {
-          window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
-        }
-        resolve(window.pdfjsLib);
-      } catch (e) {
-        _pdfJsPromise = null;
-        reject(e);
-      }
-    };
-    script.onerror = async () => {
-      _pdfJsPromise = null;
-      // Loga contexto rico antes de rejeitar — fundamental pra diagnóstico
-      const probe = await probeUrl(PDFJS_SCRIPT);
-      const swActive = typeof navigator !== "undefined" && !!navigator.serviceWorker?.controller;
-      logEvent("runtime_error", "Falha ao carregar PDF.js local", {
-        script_url: PDFJS_SCRIPT,
-        worker_url: PDFJS_WORKER,
-        probe_status: probe.status,
-        probe_status_text: probe.statusText,
-        service_worker_active: swActive,
-        location_origin: typeof location !== "undefined" ? location.origin : null,
-      });
-      reject(new Error(
-        probe.status === 404
-          ? `PDF.js não encontrado em ${PDFJS_SCRIPT} (HTTP 404). Vendorize os arquivos no repo.`
-          : `Falha ao carregar PDF.js (status ${probe.status || "?"})`
-      ));
-    };
-    document.head.appendChild(script);
-  });
-  return _pdfJsPromise;
-}
-
-// ─── Attachment Viewer (Fase 2, v1.2.5) ────────────────────────────────
-// Visualizador full-screen para imagens e PDFs. Read-only.
-// PDFs são renderizados via PDF.js (canvas) para zoom consistente com imagens.
+// ─── Attachment Viewer (Fase 2, v1.2.7) ────────────────────────────────
+// Visualizador full-screen APENAS para imagens.
+// PDFs não passam por aqui — vão direto pro Quick Look nativo do iOS via openPdfNative().
 function AttachmentViewer({ attachment, onClose }) {
   if (!attachment) return null;
-  const { type, dataUrl, name } = attachment;
-  const isPdf = type === "pdf" || /^data:application\/pdf/.test(dataUrl || "");
-
-  // PDF state
-  const [pdfPages, setPdfPages] = useState([]); // array de dataURLs (PNG) das páginas
-  const [pdfLoading, setPdfLoading] = useState(false);
-  const [pdfError, setPdfError] = useState(null);
-  const [pdfProgress, setPdfProgress] = useState(0); // 0..1
+  const { dataUrl, name } = attachment;
 
   // Zoom state
   const [scale, setScale] = useState(1);
   const [tx, setTx] = useState(0);
   const [ty, setTy] = useState(0);
   const stageRef = useRef(null);
-  const contentRef = useRef(null); // <img> para imagem, <div> para PDF
+  const contentRef = useRef(null);
   const gesture = useRef({
     pinching: false, startDist: 0, startScale: 1,
     panning: false, startX: 0, startY: 0, startTx: 0, startTy: 0,
@@ -1184,84 +1083,7 @@ function AttachmentViewer({ attachment, onClose }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  // Renderiza PDF via PDF.js
-  useEffect(() => {
-    if (!isPdf || !dataUrl) return;
-    let cancelled = false;
-    (async () => {
-      setPdfLoading(true);
-      setPdfError(null);
-      setPdfProgress(0);
-      setPdfPages([]);
-      try {
-        const pdfjsLib = await loadPdfJs();
-        // data URL → Uint8Array
-        const m = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
-        if (!m) throw new Error("data URL inválida");
-        const byteString = atob(m[2]);
-        const bytes = new Uint8Array(byteString.length);
-        for (let i = 0; i < byteString.length; i++) bytes[i] = byteString.charCodeAt(i);
-
-        const loadingTask = pdfjsLib.getDocument({ data: bytes });
-        const pdf = await loadingTask.promise;
-        if (cancelled) return;
-
-        const totalPages = pdf.numPages;
-        const renderedPages = [];
-        // Resolução base: 1.6x da escala 1 = boa qualidade pra ler texto
-        const RENDER_SCALE = 1.6;
-
-        for (let i = 1; i <= totalPages; i++) {
-          if (cancelled) return;
-          const page = await pdf.getPage(i);
-          const viewport = page.getViewport({ scale: RENDER_SCALE });
-          const canvas = document.createElement("canvas");
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          const ctx = canvas.getContext("2d");
-          await page.render({ canvasContext: ctx, viewport }).promise;
-          if (cancelled) return;
-          renderedPages.push(canvas.toDataURL("image/png"));
-          setPdfProgress(i / totalPages);
-        }
-
-        if (!cancelled) {
-          setPdfPages(renderedPages);
-          setPdfLoading(false);
-        }
-      } catch (e) {
-        if (cancelled) return;
-        setPdfError(String(e?.message || e));
-        setPdfLoading(false);
-        logEvent("runtime_error", "Falha ao renderizar PDF via PDF.js", { error: String(e?.message || e) });
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [isPdf, dataUrl]);
-
-  // Fallback: baixar o PDF original
-  const downloadOriginalPdf = () => {
-    try {
-      const m = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
-      if (!m) throw new Error("data URL inválida");
-      const byteString = atob(m[2]);
-      const bytes = new Uint8Array(byteString.length);
-      for (let i = 0; i < byteString.length; i++) bytes[i] = byteString.charCodeAt(i);
-      const blob = new Blob([bytes], { type: m[1] });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = name || "documento.pdf";
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(url), 2000);
-    } catch (e) {
-      logEvent("runtime_error", "Falha ao baixar PDF original", { error: String(e?.message || e) });
-    }
-  };
-
-  // Touch handlers (idênticos para imagem e PDF)
+  // Touch handlers (zoom + pan + double-tap)
   const onTouchStart = (e) => {
     if (e.touches.length === 2) {
       e.preventDefault();
@@ -1328,80 +1150,73 @@ function AttachmentViewer({ attachment, onClose }) {
   return (
     <div className="viewer-overlay">
       <div className="viewer-header">
-        <span className="v-title">
-          {name || (isPdf ? "documento.pdf" : "imagem")}
-          {isPdf && pdfPages.length > 1 && ` · ${pdfPages.length} páginas`}
-        </span>
+        <span className="v-title">{name || "imagem"}</span>
         <button className="v-close" onClick={onClose} aria-label="Fechar">
           {Icons.x}
         </button>
       </div>
       <div className="viewer-body">
-        {isPdf ? (
-          pdfError ? (
-            <div className="pdf-fallback">
-              <div style={{fontSize:16, color:"var(--text)", fontWeight:500, marginBottom:8}}>
-                📄 {name || "documento.pdf"}
-              </div>
-              <div style={{marginBottom:14}}>Não consegui renderizar o PDF dentro do app:<br/><span style={{color:"var(--text3)", fontSize:12}}>{pdfError}</span></div>
-              <a onClick={downloadOriginalPdf}>Baixar PDF original</a>
-            </div>
-          ) : pdfLoading ? (
-            <div className="pdf-fallback">
-              <div className="spinner" style={{margin:"0 auto 12px", width:24, height:24, borderWidth:3, color:"var(--accent)"}} />
-              <div>Renderizando PDF…</div>
-              {pdfProgress > 0 && (
-                <div style={{marginTop:8, fontSize:12, color:"var(--text3)"}}>
-                  {Math.round(pdfProgress * 100)}%
-                </div>
-              )}
-            </div>
-          ) : (
-            <div
-              ref={stageRef}
-              className="img-stage"
-              onTouchStart={onTouchStart}
-              onTouchMove={onTouchMove}
-              onTouchEnd={onTouchEnd}
-              onTouchCancel={onTouchEnd}
-            >
-              <div ref={contentRef} className="pdf-pages" style={transformStyle}>
-                {pdfPages.map((src, i) => (
-                  <img key={i} src={src} alt={`Página ${i+1}`} draggable={false} />
-                ))}
-              </div>
-            </div>
-          )
-        ) : (
-          <div
-            ref={stageRef}
-            className="img-stage"
-            onTouchStart={onTouchStart}
-            onTouchMove={onTouchMove}
-            onTouchEnd={onTouchEnd}
-            onTouchCancel={onTouchEnd}
-          >
-            <img
-              ref={contentRef}
-              src={dataUrl}
-              alt={name || "anexo"}
-              draggable={false}
-              style={transformStyle}
-            />
-          </div>
-        )}
-      </div>
-      {(!isPdf || (!pdfLoading && !pdfError && pdfPages.length > 0)) && (
-        <div className="viewer-controls">
-          <button onClick={zoomOut} disabled={scale <= MIN_SCALE} aria-label="Diminuir zoom">−</button>
-          <button onClick={zoomReset} disabled={scale === 1} aria-label="Resetar zoom">
-            {Math.round(scale * 100)}%
-          </button>
-          <button onClick={zoomIn} disabled={scale >= MAX_SCALE} aria-label="Aumentar zoom">+</button>
+        <div
+          ref={stageRef}
+          className="img-stage"
+          onTouchStart={onTouchStart}
+          onTouchMove={onTouchMove}
+          onTouchEnd={onTouchEnd}
+          onTouchCancel={onTouchEnd}
+        >
+          <img
+            ref={contentRef}
+            src={dataUrl}
+            alt={name || "anexo"}
+            draggable={false}
+            style={transformStyle}
+          />
         </div>
-      )}
+      </div>
+      <div className="viewer-controls">
+        <button onClick={zoomOut} disabled={scale <= MIN_SCALE} aria-label="Diminuir zoom">−</button>
+        <button onClick={zoomReset} disabled={scale === 1} aria-label="Resetar zoom">
+          {Math.round(scale * 100)}%
+        </button>
+        <button onClick={zoomIn} disabled={scale >= MAX_SCALE} aria-label="Aumentar zoom">+</button>
+      </div>
     </div>
   );
+}
+
+// Abre PDF no visualizador nativo do iOS (Quick Look) via blob URL.
+// Decisão: PDFKit do iOS é vastamente superior ao PDF.js em performance,
+// scroll, zoom e familiaridade com o usuário. Nada justifica reimplementar.
+function openPdfNative(dataUrl, name) {
+  try {
+    const m = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
+    if (!m) throw new Error("data URL inválida");
+    const byteString = atob(m[2]);
+    const bytes = new Uint8Array(byteString.length);
+    for (let i = 0; i < byteString.length; i++) bytes[i] = byteString.charCodeAt(i);
+    const blob = new Blob([bytes], { type: m[1] || "application/pdf" });
+    const url = URL.createObjectURL(blob);
+    // window.open com _blank em iOS Safari standalone abre o Quick Look nativo
+    const w = window.open(url, "_blank");
+    if (!w) {
+      // fallback: usa <a> com download/target=_blank
+      const a = document.createElement("a");
+      a.href = url;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      if (name) a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
+    // Libera depois de um tempo (o iOS já carregou o PDF na tela)
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch (e) {
+    logEvent("runtime_error", "Falha ao abrir PDF no visualizador nativo", {
+      error: String(e?.message || e),
+      name: name || null,
+    });
+  }
 }
 
 // ─── Main App ────────────────────────────────────────────────────────────
@@ -2030,7 +1845,7 @@ function CapturePage({ trip, config, onSave, onBack }) {
             <div className="section-head">Anexo da despesa</div>
 
             {attachment?.type === "pdf" ? (
-              <div className="pdf-card preview-tappable" onClick={() => setShowViewer(true)}>
+              <div className="pdf-card preview-tappable" onClick={() => openPdfNative(attachment.dataUrl, attachment.name)}>
                 <div className="pdf-icon">{Icons.fileText}</div>
                 <div className="pdf-body">
                   <div className="pdf-name">{attachment.name}</div>
@@ -2080,7 +1895,7 @@ function CapturePage({ trip, config, onSave, onBack }) {
           <>
             <div className="section-head">Dados da despesa</div>
             {attachment?.type === "pdf" ? (
-              <div className="pdf-card preview-tappable" style={{margin:"0 16px 12px"}} onClick={() => setShowViewer(true)}>
+              <div className="pdf-card preview-tappable" style={{margin:"0 16px 12px"}} onClick={() => openPdfNative(attachment.dataUrl, attachment.name)}>
                 <div className="pdf-icon">{Icons.fileText}</div>
                 <div className="pdf-body">
                   <div className="pdf-name">{attachment.name}</div>
@@ -2282,7 +2097,7 @@ function CapturePage({ trip, config, onSave, onBack }) {
         <div className="safe-bottom" />
       </div>
 
-      {showViewer && attachment && (
+      {showViewer && attachment && attachment.type !== "pdf" && (
         <AttachmentViewer attachment={attachment} onClose={() => setShowViewer(false)} />
       )}
     </div>
@@ -2408,7 +2223,7 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
 
       <div className="scroll">
         {photo && attachmentType === "pdf" ? (
-          <div className="pdf-card preview-tappable" style={{margin:"12px 16px 0"}} onClick={() => setShowViewer(true)}>
+          <div className="pdf-card preview-tappable" style={{margin:"12px 16px 0"}} onClick={() => openPdfNative(photo, attachmentName)}>
             <div className="pdf-icon">{Icons.fileText}</div>
             <div className="pdf-body">
               <div className="pdf-name">{attachmentName || "documento.pdf"}</div>
@@ -2613,7 +2428,7 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
         </div>
       )}
 
-      {showViewer && attachmentForViewer && (
+      {showViewer && attachmentForViewer && attachmentForViewer.type !== "pdf" && (
         <AttachmentViewer attachment={attachmentForViewer} onClose={() => setShowViewer(false)} />
       )}
     </div>
