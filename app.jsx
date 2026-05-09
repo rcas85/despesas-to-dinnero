@@ -2,7 +2,7 @@ const { useState, useEffect, useCallback, useRef } = React;
 
 // ─── Build flags ─────────────────────────────────────────────────────────
 const IS_BETA = true;
-const APP_VERSION_BASE = "1.2.3";
+const APP_VERSION_BASE = "1.2.4";
 const APP_VERSION = IS_BETA ? `${APP_VERSION_BASE}-beta` : APP_VERSION_BASE;
 
 // ─── Constants ───────────────────────────────────────────────────────────
@@ -947,13 +947,17 @@ html, body, #root {
   position:fixed; inset:0; background:rgba(0,0,0,0.92);
   z-index:200; display:flex; flex-direction:column;
   animation:fadeIn 0.2s;
+  /* Importante: deixa pinch/pan acontecer dentro */
+  touch-action: none;
 }
 .viewer-header {
   display:flex; align-items:center; gap:10px;
   padding: calc(10px + var(--safe-top)) 14px 10px;
   background:linear-gradient(to bottom, rgba(0,0,0,0.85), rgba(0,0,0,0));
   position:absolute; top:0; left:0; right:0; z-index:2;
+  pointer-events:none;
 }
+.viewer-header > * { pointer-events:auto; }
 .viewer-header .v-title {
   flex:1; font-size:13px; color:var(--text2);
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
@@ -966,34 +970,63 @@ html, body, #root {
 }
 .viewer-header .v-close:active { background:rgba(255,255,255,0.2); }
 .viewer-body {
-  flex:1; min-height:0; overflow:auto;
+  flex:1; min-height:0; overflow:hidden;
   display:flex; align-items:center; justify-content:center;
   padding: calc(56px + var(--safe-top)) 0 calc(20px + var(--safe-bottom));
-  -webkit-overflow-scrolling:touch;
 }
 .viewer-body.pdf {
   padding: calc(56px + var(--safe-top)) 0 calc(20px + var(--safe-bottom));
   align-items:stretch;
-}
-.viewer-body img {
-  max-width:100%; height:auto; display:block;
+  overflow:auto;
 }
 .viewer-body iframe, .viewer-body embed, .viewer-body object {
   width:100%; height:100%; border:0; background:white;
-}
-.viewer-body .pdf-frame {
-  flex:1; align-self:stretch; width:100%;
-  display:flex; flex-direction:column; min-height:60vh;
+  /* Permite que gestos cheguem ao iframe nativo */
+  touch-action: auto;
 }
 .viewer-body .pdf-fallback {
   padding:32px 24px; text-align:center; color:var(--text2); font-size:14px;
   line-height:1.6; align-self:center; max-width:320px;
 }
-.viewer-body .pdf-fallback a {
-  color:var(--accent); text-decoration:none; font-weight:600;
-  display:inline-block; margin-top:14px;
-  padding:10px 20px; border:1px solid var(--accent);
-  border-radius:var(--radius-sm);
+
+/* Image stage with zoom/pan */
+.img-stage {
+  width:100%; height:100%; overflow:hidden;
+  display:flex; align-items:center; justify-content:center;
+  touch-action: none; /* Captura todos os gestos para nosso handler */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+.img-stage img {
+  max-width:100%; max-height:100%;
+  display:block;
+  transform-origin: center center;
+  will-change: transform;
+  -webkit-user-drag: none;
+}
+
+/* Zoom controls */
+.viewer-controls {
+  position:absolute; bottom: calc(20px + var(--safe-bottom));
+  left:50%; transform:translateX(-50%);
+  display:flex; align-items:center; gap:4px;
+  background:rgba(0,0,0,0.7); backdrop-filter:blur(10px);
+  border-radius:24px; padding:4px;
+  z-index:3;
+}
+.viewer-controls button {
+  min-width:42px; height:38px; padding:0 14px;
+  border:none; background:transparent;
+  color:white; font-family:var(--font); font-size:16px; font-weight:600;
+  cursor:pointer; border-radius:20px;
+  display:flex; align-items:center; justify-content:center;
+}
+.viewer-controls button:active { background:rgba(255,255,255,0.15); }
+.viewer-controls button:disabled { opacity:0.35; pointer-events:none; }
+.viewer-controls button:nth-child(2) {
+  font-size:13px; min-width:60px;
+  font-family:var(--mono); font-weight:500;
 }
 
 /* Tappable preview hint */
@@ -1009,14 +1042,71 @@ html, body, #root {
 .preview-tappable:active { opacity:0.85; }
 `;
 
-// ─── Attachment Viewer (Fase 2, v1.2.2) ────────────────────────────────
-// Visualizador full-screen para imagens e PDFs. Read-only (só visualizar).
+// ─── Attachment Viewer (Fase 2, v1.2.4) ────────────────────────────────
+// Visualizador full-screen para imagens e PDFs. Read-only.
+// - Imagens: zoom via pinça, double-tap, e botões + / − ; pan ao arrastar quando ampliada
+// - PDFs: iframe com blob URL, controles nativos do visualizador iOS de PDF
 function AttachmentViewer({ attachment, onClose }) {
   if (!attachment) return null;
   const { type, dataUrl, name } = attachment;
   const isPdf = type === "pdf" || /^data:application\/pdf/.test(dataUrl || "");
   const [pdfBlobUrl, setPdfBlobUrl] = useState(null);
   const [pdfError, setPdfError] = useState(null);
+
+  // Zoom state para imagens
+  const [scale, setScale] = useState(1);
+  const [tx, setTx] = useState(0);
+  const [ty, setTy] = useState(0);
+  const stageRef = useRef(null);
+  const imgRef = useRef(null);
+  // Refs internos (não causam re-render)
+  const gesture = useRef({
+    pinching: false,
+    startDist: 0,
+    startScale: 1,
+    panning: false,
+    startX: 0,
+    startY: 0,
+    startTx: 0,
+    startTy: 0,
+    lastTap: 0,
+  });
+
+  const MIN_SCALE = 1;
+  const MAX_SCALE = 5;
+
+  const clampPan = (nextTx, nextTy, nextScale) => {
+    // Limita o pan pra imagem não sair completamente da tela
+    const stage = stageRef.current;
+    const img = imgRef.current;
+    if (!stage || !img) return [nextTx, nextTy];
+    const sw = stage.clientWidth;
+    const sh = stage.clientHeight;
+    const iw = img.naturalWidth || img.clientWidth;
+    const ih = img.naturalHeight || img.clientHeight;
+    if (!iw || !ih) return [nextTx, nextTy];
+    // Tamanho renderizado base: contain
+    const baseScale = Math.min(sw / iw, sh / ih);
+    const w = iw * baseScale * nextScale;
+    const h = ih * baseScale * nextScale;
+    const maxX = Math.max(0, (w - sw) / 2);
+    const maxY = Math.max(0, (h - sh) / 2);
+    return [
+      Math.max(-maxX, Math.min(maxX, nextTx)),
+      Math.max(-maxY, Math.min(maxY, nextTy)),
+    ];
+  };
+
+  const applyScale = (nextScale, centerX, centerY) => {
+    const s = Math.max(MIN_SCALE, Math.min(MAX_SCALE, nextScale));
+    if (s === 1) {
+      setScale(1); setTx(0); setTy(0); return;
+    }
+    setScale(s);
+    // recalcula clamp do pan atual
+    const [cx, cy] = clampPan(tx, ty, s);
+    setTx(cx); setTy(cy);
+  };
 
   // Fecha com Esc no desktop
   useEffect(() => {
@@ -1030,7 +1120,6 @@ function AttachmentViewer({ attachment, onClose }) {
     if (!isPdf || !dataUrl) return;
     let blobUrl = null;
     try {
-      // data:application/pdf;base64,XXX → bytes
       const m = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
       if (!m) throw new Error("data URL inválida");
       const byteString = atob(m[2]);
@@ -1048,15 +1137,78 @@ function AttachmentViewer({ attachment, onClose }) {
     };
   }, [isPdf, dataUrl]);
 
+  // Touch handlers para imagem
+  const onTouchStart = (e) => {
+    if (e.touches.length === 2) {
+      // Pinch start
+      e.preventDefault();
+      const [t1, t2] = [e.touches[0], e.touches[1]];
+      const dx = t1.clientX - t2.clientX;
+      const dy = t1.clientY - t2.clientY;
+      gesture.current.pinching = true;
+      gesture.current.panning = false;
+      gesture.current.startDist = Math.hypot(dx, dy);
+      gesture.current.startScale = scale;
+    } else if (e.touches.length === 1 && scale > 1) {
+      // Pan start (só quando ampliada)
+      const t = e.touches[0];
+      gesture.current.panning = true;
+      gesture.current.pinching = false;
+      gesture.current.startX = t.clientX;
+      gesture.current.startY = t.clientY;
+      gesture.current.startTx = tx;
+      gesture.current.startTy = ty;
+    } else if (e.touches.length === 1) {
+      // Detecta double-tap pra alternar zoom
+      const now = Date.now();
+      if (now - gesture.current.lastTap < 300) {
+        e.preventDefault();
+        applyScale(scale > 1 ? 1 : 2.5);
+        gesture.current.lastTap = 0;
+      } else {
+        gesture.current.lastTap = now;
+      }
+    }
+  };
+
+  const onTouchMove = (e) => {
+    if (gesture.current.pinching && e.touches.length === 2) {
+      e.preventDefault();
+      const [t1, t2] = [e.touches[0], e.touches[1]];
+      const dx = t1.clientX - t2.clientX;
+      const dy = t1.clientY - t2.clientY;
+      const dist = Math.hypot(dx, dy);
+      const ratio = dist / (gesture.current.startDist || 1);
+      const next = gesture.current.startScale * ratio;
+      applyScale(next);
+    } else if (gesture.current.panning && e.touches.length === 1) {
+      e.preventDefault();
+      const t = e.touches[0];
+      const dx = t.clientX - gesture.current.startX;
+      const dy = t.clientY - gesture.current.startY;
+      const [cx, cy] = clampPan(gesture.current.startTx + dx, gesture.current.startTy + dy, scale);
+      setTx(cx); setTy(cy);
+    }
+  };
+
+  const onTouchEnd = (e) => {
+    if (e.touches.length < 2) gesture.current.pinching = false;
+    if (e.touches.length < 1) gesture.current.panning = false;
+  };
+
+  const zoomIn = () => applyScale(scale + 0.5);
+  const zoomOut = () => applyScale(scale - 0.5);
+  const zoomReset = () => applyScale(1);
+
   return (
-    <div className="viewer-overlay" onClick={onClose}>
-      <div className="viewer-header" onClick={e => e.stopPropagation()}>
+    <div className="viewer-overlay">
+      <div className="viewer-header">
         <span className="v-title">{name || (isPdf ? "documento.pdf" : "imagem")}</span>
         <button className="v-close" onClick={onClose} aria-label="Fechar">
           {Icons.x}
         </button>
       </div>
-      <div className={`viewer-body ${isPdf ? "pdf" : ""}`} onClick={e => e.stopPropagation()}>
+      <div className={`viewer-body ${isPdf ? "pdf" : ""}`}>
         {isPdf ? (
           pdfError ? (
             <div className="pdf-fallback">
@@ -1066,19 +1218,45 @@ function AttachmentViewer({ attachment, onClose }) {
               <div>Não consegui renderizar este PDF: {pdfError}</div>
             </div>
           ) : pdfBlobUrl ? (
-            // Em iOS Safari, blob URL com type=application/pdf renderiza dentro de iframe
             <iframe
               src={pdfBlobUrl}
               title={name || "PDF"}
-              style={{width:"100%", height:"100%", border:0, background:"white"}}
+              style={{width:"100%", height:"100%", border:0, background:"white", touchAction:"auto"}}
             />
           ) : (
             <div className="pdf-fallback">Carregando PDF…</div>
           )
         ) : (
-          <img src={dataUrl} alt={name || "anexo"} />
+          <div
+            ref={stageRef}
+            className="img-stage"
+            onTouchStart={onTouchStart}
+            onTouchMove={onTouchMove}
+            onTouchEnd={onTouchEnd}
+            onTouchCancel={onTouchEnd}
+          >
+            <img
+              ref={imgRef}
+              src={dataUrl}
+              alt={name || "anexo"}
+              draggable={false}
+              style={{
+                transform: `translate(${tx}px, ${ty}px) scale(${scale})`,
+                transition: gesture.current.pinching || gesture.current.panning ? "none" : "transform 0.18s ease-out",
+              }}
+            />
+          </div>
         )}
       </div>
+      {!isPdf && (
+        <div className="viewer-controls">
+          <button onClick={zoomOut} disabled={scale <= MIN_SCALE} aria-label="Diminuir zoom">−</button>
+          <button onClick={zoomReset} disabled={scale === 1} aria-label="Resetar zoom">
+            {Math.round(scale * 100)}%
+          </button>
+          <button onClick={zoomIn} disabled={scale >= MAX_SCALE} aria-label="Aumentar zoom">+</button>
+        </div>
+      )}
     </div>
   );
 }
