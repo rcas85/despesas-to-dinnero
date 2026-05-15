@@ -2,7 +2,7 @@ const { useState, useEffect, useCallback, useRef } = React;
 
 // ─── Build flags ─────────────────────────────────────────────────────────
 const IS_BETA = true;
-const APP_VERSION_BASE = "1.2.7";
+const APP_VERSION_BASE = "1.2.9";
 const APP_VERSION = IS_BETA ? `${APP_VERSION_BASE}-beta` : APP_VERSION_BASE;
 
 // ─── Constants ───────────────────────────────────────────────────────────
@@ -239,6 +239,124 @@ function installRuntimeErrorHandlers() {
   });
 }
 
+// ─── Participantes (v1.2.8) ────────────────────────────────────────────
+// Estrutura: { nome, validado, usado_em, ultimo_uso }
+// validado = true significa que o nome já foi confirmado pelo Dinnero (preparação para Fase 4)
+// usado_em = contador de quantas vezes o nome foi usado em despesas
+// ultimo_uso = data ISO do último uso (para ordenação por recência)
+
+function normalizeParticipant(p) {
+  // Aceita string (formato antigo) ou objeto e devolve sempre objeto
+  if (typeof p === "string") {
+    return { nome: p, validado: false, usado_em: 0, ultimo_uso: null };
+  }
+  if (p && typeof p === "object" && p.nome) {
+    return {
+      nome: String(p.nome),
+      validado: !!p.validado,
+      usado_em: typeof p.usado_em === "number" ? p.usado_em : 0,
+      ultimo_uso: p.ultimo_uso || null,
+    };
+  }
+  return null;
+}
+
+function normalizeParticipantList(list) {
+  if (!Array.isArray(list)) return [];
+  return list.map(normalizeParticipant).filter(Boolean);
+}
+
+// Adiciona/atualiza participante na lista. Se nome já existe (case-insensitive), incrementa contadores.
+// Se não existe, cria entrada nova como não-validada.
+function addOrUpdateParticipant(list, nome) {
+  const normalized = normalizeParticipantList(list);
+  const trimmed = String(nome || "").trim();
+  if (!trimmed) return normalized;
+  const idx = normalized.findIndex(p => p.nome.toUpperCase() === trimmed.toUpperCase());
+  const today = todayISO();
+  if (idx >= 0) {
+    // Existe — incrementa contador e atualiza data
+    normalized[idx] = {
+      ...normalized[idx],
+      usado_em: (normalized[idx].usado_em || 0) + 1,
+      ultimo_uso: today,
+    };
+  } else {
+    // Novo — adiciona como não validado
+    normalized.push({
+      nome: trimmed,
+      validado: false,
+      usado_em: 1,
+      ultimo_uso: today,
+    });
+  }
+  return normalized;
+}
+
+// Distância de Levenshtein (algoritmo clássico, eficiente o suficiente p/ listas curtas)
+function levenshtein(a, b) {
+  a = (a || "").toLowerCase();
+  b = (b || "").toLowerCase();
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const matrix = [];
+  for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+  for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      const cost = a.charAt(j - 1) === b.charAt(i - 1) ? 0 : 1;
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,         // deletion
+        matrix[i][j - 1] + 1,         // insertion
+        matrix[i - 1][j - 1] + cost,  // substitution
+      );
+    }
+  }
+  return matrix[b.length][a.length];
+}
+
+// Busca aproximada na lista de frequentes, considerando:
+//   - prefix match (começa com a query) — mais relevante
+//   - substring match (contém a query)
+//   - fuzzy match (Levenshtein <= 2) — pega typos
+// Resultados ordenados por relevância: prefix > substring > fuzzy
+function searchParticipants(list, query, opts = {}) {
+  const { limit = 8 } = opts;
+  const normalized = normalizeParticipantList(list);
+  const q = String(query || "").trim().toLowerCase();
+  if (!q) {
+    // Sem query: devolve os mais usados/recentes
+    return normalized
+      .slice()
+      .sort((a, b) => (b.usado_em || 0) - (a.usado_em || 0) || (b.ultimo_uso || "").localeCompare(a.ultimo_uso || ""))
+      .slice(0, limit);
+  }
+  const scored = normalized.map(p => {
+    const name = p.nome.toLowerCase();
+    let score;
+    let kind;
+    if (name.startsWith(q)) { score = 0; kind = "prefix"; }
+    else if (name.includes(q)) { score = 1; kind = "substring"; }
+    else {
+      // Tenta fuzzy: distância entre query e cada palavra do nome
+      const words = name.split(/\s+/);
+      const minDist = Math.min(...words.map(w => levenshtein(q, w.slice(0, q.length + 2))));
+      if (minDist <= Math.min(2, Math.floor(q.length / 3))) {
+        score = 2 + minDist;
+        kind = "fuzzy";
+      } else {
+        return null;
+      }
+    }
+    return { p, score, kind };
+  }).filter(Boolean);
+  scored.sort((a, b) => a.score - b.score
+    || (b.p.validado ? 1 : 0) - (a.p.validado ? 1 : 0)
+    || (b.p.usado_em || 0) - (a.p.usado_em || 0));
+  return scored.slice(0, limit).map(x => ({ ...x.p, _matchKind: x.kind }));
+}
+
 // ─── Gemini API (Fase 2) ────────────────────────────────────────────────
 // Documentação: https://ai.google.dev/gemini-api/docs
 // Modelo: gemini-2.5-flash | Free tier: 1500 req/dia
@@ -263,6 +381,7 @@ Retorne APENAS um JSON válido (sem markdown, sem comentários, sem texto antes 
   "diarias_extraidas": number ou null,  // só para hospedagem: nº de diárias (inteiro). Calcule por checkin/checkout se necessário.
   "placa_veiculo": string ou null,      // só para combustível: placa do veículo (ex: ABC1D23), se aparecer no cupom
   "km_rodados": number ou null,         // só para km rodado: quantidade de km rodados (inteiro)
+  "participantes_estimados": number ou null,  // só para refeições: estimativa do nº de pessoas, ver heurísticas abaixo
   "categoria_sugerida": string,         // exatamente uma das categorias da lista abaixo
   "justificativa_sugerida": string,     // texto curto seguindo as regras abaixo
   "confianca": number                   // 0 a 1, sua confiança média na extração
@@ -283,6 +402,18 @@ HEURÍSTICAS PARA SUGERIR CATEGORIA:
 - Companhia aérea (Latam, Gol, Azul, Avianca) → "Passagens aéreas"
 - Locadora de veículos (Localiza, Movida, Unidas) → "Aluguel de veículos em viagem"
 - Lava-jato, lava-rápido → "Lavação/higienização de veículos"
+
+HEURÍSTICAS PARA INFERIR "participantes_estimados" (preencher SOMENTE se a categoria for refeição: café da manhã, almoço, jantar, lanches):
+- Conte "couvert" cobrados — cada couvert costuma representar 1 pessoa
+- Procure frações de conta tipo "1/3 conta", "1/4 conta" — o denominador indica o nº de pessoas dividindo
+- Conte pratos principais distintos no cupom (não conte bebidas/sobremesas isoladamente)
+- Se houver "taxa de serviço" calculada sobre N pessoas, use N
+- Fallback de estimativa por valor total ÷ ticket médio típico:
+  - Café da manhã: ~R$ 25-40 por pessoa
+  - Almoço executivo: ~R$ 70-100 por pessoa
+  - Almoço/jantar à la carte: ~R$ 100-180 por pessoa
+- Se NÃO houver nenhum sinal confiável, retorne null (NÃO chute valor)
+- Para categorias que NÃO sejam refeição, sempre retorne null
 
 REGRAS PARA "justificativa_sugerida" (texto curto, em letras minúsculas no início, sem ponto final, em português):
 - Almoço/Jantar/Café da manhã: "almoço em [estabelecimento][, cidade se houver]" / "jantar..." / "café da manhã..."
@@ -410,6 +541,7 @@ async function geminiExtractFromImage(apiKey, fileDataUrl) {
     diarias_extraidas: numOrNull(data.diarias_extraidas),
     placa_veiculo: data.placa_veiculo ? String(data.placa_veiculo).toUpperCase().replace(/[^A-Z0-9]/g, "") : null,
     km_rodados: numOrNull(data.km_rodados),
+    participantes_estimados: numOrNull(data.participantes_estimados),
     categoria_sugerida: data.categoria_sugerida && CATEGORIES.includes(data.categoria_sugerida) ? data.categoria_sugerida : "",
     justificativa_sugerida: data.justificativa_sugerida || "",
     confianca: typeof data.confianca === "number" ? data.confianca : 0.5,
@@ -517,6 +649,9 @@ const Icons = {
   ),
   maximize: (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+  ),
+  image: (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
   ),
 };
 
@@ -700,6 +835,15 @@ html, body, #root {
 .chip:active { background:var(--border); }
 .chip.selected { background:var(--accent-dim); border-color:var(--accent); color:var(--accent); }
 .chip .chip-x { color:var(--text3); margin-left:2px; font-size:16px; line-height:1; }
+.chip.chip-validated {
+  border-color:rgba(74,222,128,0.45); background:var(--accent-dim);
+}
+.chip.chip-validated .chip-check {
+  color:var(--accent); font-weight:700; font-size:13px; line-height:1;
+}
+.chip.chip-fuzzy {
+  border-style:dashed; opacity:0.85;
+}
 
 /* Category grid */
 .cat-quick { display:flex; flex-wrap:wrap; padding:0 13px 8px; gap:0; }
@@ -929,14 +1073,18 @@ html, body, #root {
 
 /* Dual capture buttons (Foto / PDF) */
 .capture-buttons {
-  display:flex; gap:8px; margin:8px 16px 12px;
+  display:flex; gap:6px; margin:8px 16px 12px;
 }
 .capture-buttons .cap-btn {
-  flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
-  gap:6px; padding:14px 8px; border-radius:var(--radius);
+  flex:1; min-width:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:6px; padding:14px 4px; border-radius:var(--radius);
   background:var(--bg2); border:1px dashed var(--border2);
   color:var(--text2); cursor:pointer; transition:all 0.15s;
   font-family:var(--font); font-size:12px; font-weight:500;
+  text-align:center;
+}
+.capture-buttons .cap-btn span:last-child {
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%;
 }
 .capture-buttons .cap-btn:active { background:var(--bg3); border-color:var(--accent); color:var(--accent); }
 .capture-buttons .cap-btn .cap-icon { color:var(--text3); }
@@ -1263,6 +1411,22 @@ function App() {
     setConfig(data);
   }, []);
 
+  // Auto-cadastra participantes usados em uma despesa na lista de frequentes (v1.2.8)
+  const autoRegisterParticipants = useCallback(async (expense) => {
+    const nomes = expense?.participantes?.internos || [];
+    if (!nomes.length) return;
+    setConfig(prev => {
+      let list = normalizeParticipantList(prev.participantes_frequentes);
+      for (const n of nomes) list = addOrUpdateParticipant(list, n);
+      const next = { ...prev, participantes_frequentes: list };
+      // Persiste no IndexedDB (fire-and-forget)
+      dbPut("config", { ...next, key: "user" }).catch(e =>
+        logEvent("runtime_error", "Falha ao auto-cadastrar participantes", { error: String(e?.message || e) })
+      );
+      return next;
+    });
+  }, []);
+
   const showToast = useCallback((msg) => {
     setToast(msg);
     setTimeout(() => setToast(null), 2000);
@@ -1302,6 +1466,7 @@ function App() {
           trip={currentTrip}
           config={config}
           onSave={(exp) => {
+            autoRegisterParticipants(exp);
             const updated = { ...currentTrip, despesas: [...(currentTrip.despesas || []), exp] };
             saveTrip(updated);
             showToast("Despesa salva!");
@@ -1316,6 +1481,7 @@ function App() {
           expense={currentExpense}
           config={config}
           onSave={(exp) => {
+            autoRegisterParticipants(exp);
             const updated = {
               ...currentTrip,
               despesas: currentTrip.despesas.map(d => d.despesa_id === exp.despesa_id ? exp : d)
@@ -1687,10 +1853,12 @@ function CapturePage({ trip, config, onSave, onBack }) {
   const [justSuggested, setJustSuggested] = useState("");
   const [horario, setHorario] = useState(null);
   const [cnpj, setCnpj] = useState(null);
+  const [qtdParticipantesEstimada, setQtdParticipantesEstimada] = useState(null);
   // Fase 2: anexo (imagem ou PDF)
   const [attachment, setAttachment] = useState(null); // {type: 'image'|'pdf', dataUrl, name, size}
   const [showViewer, setShowViewer] = useState(false);
   const fileRef = useRef(null);
+  const galleryRef = useRef(null);
   const pdfRef = useRef(null);
 
   const hasKey = !!(config.gemini_api_key && config.gemini_api_key.trim());
@@ -1720,6 +1888,7 @@ function CapturePage({ trip, config, onSave, onBack }) {
       if (r.diarias_extraidas != null) setDiarias(String(r.diarias_extraidas));
       if (r.placa_veiculo) setPlaca(r.placa_veiculo);
       if (r.km_rodados != null) setKm(String(r.km_rodados));
+      if (r.participantes_estimados != null) setQtdParticipantesEstimada(r.participantes_estimados);
       setAiConfidence(r.confianca);
       setAiExtracted(true);
     } catch (e) {
@@ -1766,6 +1935,7 @@ function CapturePage({ trip, config, onSave, onBack }) {
   };
 
   const handlePhoto = (e) => handleFile(e.target.files?.[0]);
+  const handleGallery = (e) => handleFile(e.target.files?.[0]);
   const handlePdf = (e) => handleFile(e.target.files?.[0]);
 
   const handleSave = () => {
@@ -1814,12 +1984,11 @@ function CapturePage({ trip, config, onSave, onBack }) {
     setNewParticipant("");
   };
 
-  const freqParticipants = config.participantes_frequentes || [];
-  const suggestedP = freqParticipants.filter(p =>
-    newParticipant.length > 0 &&
-    p.toLowerCase().includes(newParticipant.toLowerCase()) &&
-    !participantes.includes(p)
-  );
+  // Lista de frequentes (normalizada para o novo formato)
+  const freqParticipants = normalizeParticipantList(config.participantes_frequentes);
+  // Busca fuzzy/inteligente (v1.2.8): pega prefix, substring e typos próximos
+  const suggestedP = searchParticipants(freqParticipants, newParticipant, { limit: 6 })
+    .filter(p => !participantes.includes(p.nome));
 
   const canSave = estab.trim() && cat;
 
@@ -1873,7 +2042,11 @@ function CapturePage({ trip, config, onSave, onBack }) {
               <div className="capture-buttons">
                 <button className="cap-btn" onClick={() => fileRef.current?.click()}>
                   <span className="cap-icon">{Icons.camera}</span>
-                  <span>Tirar foto / galeria</span>
+                  <span>Tirar foto</span>
+                </button>
+                <button className="cap-btn" onClick={() => galleryRef.current?.click()}>
+                  <span className="cap-icon">{Icons.image}</span>
+                  <span>Da fototeca</span>
                 </button>
                 <button className="cap-btn" onClick={() => pdfRef.current?.click()}>
                   <span className="cap-icon">{Icons.fileText}</span>
@@ -1883,6 +2056,7 @@ function CapturePage({ trip, config, onSave, onBack }) {
             )}
 
             <input ref={fileRef} type="file" accept="image/*" capture="environment" onChange={handlePhoto} style={{ display:"none" }} />
+            <input ref={galleryRef} type="file" accept="image/*" onChange={handleGallery} style={{ display:"none" }} />
             <input ref={pdfRef} type="file" accept="application/pdf,.pdf" onChange={handlePdf} style={{ display:"none" }} />
 
             <button className="fab secondary" onClick={() => setStep(1)}>
@@ -2035,6 +2209,16 @@ function CapturePage({ trip, config, onSave, onBack }) {
             {isMeal && (
               <>
                 <div className="section-head" style={{ marginTop:4 }}>Participantes da refeição</div>
+                {qtdParticipantesEstimada != null && participantes.length < qtdParticipantesEstimada && (
+                  <div className="suggest-cat" style={{marginBottom:8}}>
+                    <span style={{display:"flex"}}>{Icons.sparkle}</span>
+                    <span>
+                      IA estima <strong>{qtdParticipantesEstimada} {qtdParticipantesEstimada === 1 ? "pessoa" : "pessoas"}</strong>
+                      {participantes.length > 0 && ` · faltam ${qtdParticipantesEstimada - participantes.length}`}
+                    </span>
+                    <button className="sc-x" onClick={() => setQtdParticipantesEstimada(null)} aria-label="Dispensar">{Icons.x}</button>
+                  </div>
+                )}
                 {participantes.map((p, i) => (
                   <div key={i} className="participant-row">
                     <span style={{ color:"var(--text3)" }}>{Icons.user}</span>
@@ -2058,8 +2242,11 @@ function CapturePage({ trip, config, onSave, onBack }) {
                 {suggestedP.length > 0 && (
                   <div style={{ padding:"0 16px 8px", display:"flex", flexWrap:"wrap", gap:4 }}>
                     {suggestedP.map(p => (
-                      <div key={p} className="chip" onClick={() => { setParticipantes([...participantes, p]); setNewParticipant(""); }}>
-                        {p}
+                      <div key={p.nome}
+                        className={`chip ${p.validado ? "chip-validated" : ""} ${p._matchKind === "fuzzy" ? "chip-fuzzy" : ""}`}
+                        onClick={() => { setParticipantes([...participantes, p.nome]); setNewParticipant(""); }}>
+                        {p.validado && <span className="chip-check">✓</span>}
+                        {p.nome}
                       </div>
                     ))}
                   </div>
@@ -2144,12 +2331,9 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
   const profile = CATEGORY_PROFILES[cat];
   const needsConditional = !!profile?.campo;
 
-  const freqParticipants = config.participantes_frequentes || [];
-  const suggestedP = freqParticipants.filter(p =>
-    newParticipant.length > 0 &&
-    p.toLowerCase().includes(newParticipant.toLowerCase()) &&
-    !participantes.includes(p)
-  );
+  const freqParticipants = normalizeParticipantList(config.participantes_frequentes);
+  const suggestedP = searchParticipants(freqParticipants, newParticipant, { limit: 6 })
+    .filter(p => !participantes.includes(p.nome));
 
   const addParticipant = () => {
     const name = newParticipant.trim();
@@ -2370,8 +2554,11 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
             {suggestedP.length > 0 && (
               <div style={{ padding:"0 16px 8px", display:"flex", flexWrap:"wrap", gap:4 }}>
                 {suggestedP.map(p => (
-                  <div key={p} className="chip" onClick={() => { setParticipantes([...participantes, p]); setNewParticipant(""); }}>
-                    {p}
+                  <div key={p.nome}
+                    className={`chip ${p.validado ? "chip-validated" : ""} ${p._matchKind === "fuzzy" ? "chip-fuzzy" : ""}`}
+                    onClick={() => { setParticipantes([...participantes, p.nome]); setNewParticipant(""); }}>
+                    {p.validado && <span className="chip-check">✓</span>}
+                    {p.nome}
                   </div>
                 ))}
               </div>
@@ -2558,7 +2745,7 @@ function ExportPage({ trip, onBack, onExported }) {
 // ─── Settings Page ───────────────────────────────────────────────────────
 function SettingsPage({ config, onSave, onBack, showToast }) {
   const [nome, setNome] = useState(config.nome || "");
-  const [partList, setPartList] = useState(config.participantes_frequentes || []);
+  const [partList, setPartList] = useState(() => normalizeParticipantList(config.participantes_frequentes));
   const [newPart, setNewPart] = useState("");
   // Fase 2: chave Gemini
   const [apiKey, setApiKey] = useState(config.gemini_api_key || "");
@@ -2646,7 +2833,11 @@ function SettingsPage({ config, onSave, onBack, showToast }) {
 
   const addPart = () => {
     const n = newPart.trim().toUpperCase();
-    if (n && !partList.includes(n)) setPartList([...partList, n]);
+    if (!n) { setNewPart(""); return; }
+    // Verifica duplicata case-insensitive
+    if (!partList.some(p => p.nome.toUpperCase() === n)) {
+      setPartList([...partList, { nome: n, validado: false, usado_em: 0, ultimo_uso: null }]);
+    }
     setNewPart("");
   };
 
@@ -2727,12 +2918,24 @@ function SettingsPage({ config, onSave, onBack, showToast }) {
 
         <div className="section-head">Participantes frequentes</div>
         <div style={{ padding:"0 16px 4px", fontSize:12, color:"var(--text3)", lineHeight:1.4 }}>
-          Nomes que aparecerão como sugestão ao cadastrar participantes em refeições.
+          Nomes que aparecerão como sugestão ao cadastrar participantes em refeições. Os com <span style={{color:"var(--accent)"}}>✓</span> já foram confirmados pelo Dinnero (preparação para o agente).
         </div>
+        {partList.length === 0 && (
+          <div style={{padding:"8px 16px", fontSize:13, color:"var(--text3)"}}>
+            Lista vazia. Nomes adicionados em despesas aparecerão aqui automaticamente.
+          </div>
+        )}
         {partList.map((p, i) => (
           <div key={i} className="participant-row">
-            <span style={{ color:"var(--text3)" }}>{Icons.user}</span>
-            <span className="p-name">{p}</span>
+            <span style={{ color: p.validado ? "var(--accent)" : "var(--text3)" }}>
+              {p.validado ? "✓" : Icons.user}
+            </span>
+            <span className="p-name">{p.nome}</span>
+            {p.usado_em > 0 && (
+              <span style={{ fontSize:11, color:"var(--text3)", marginRight:8 }}>
+                {p.usado_em}×
+              </span>
+            )}
             <button className="p-remove" onClick={() => setPartList(partList.filter((_, j) => j !== i))}>×</button>
           </div>
         ))}
