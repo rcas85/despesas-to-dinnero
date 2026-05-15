@@ -945,11 +945,32 @@ html, body, #root {
 /* Toast */
 .toast {
   position:fixed; bottom:calc(24px + var(--safe-bottom)); left:50%; transform:translateX(-50%);
-  background:var(--accent); color:var(--bg); padding:10px 20px;
-  border-radius:20px; font-size:14px; font-weight:600; z-index:200;
-  animation:toastIn 0.3s ease-out; pointer-events:none;
-  box-shadow:0 8px 30px rgba(74,222,128,0.3);
+  background:var(--bg3); color:var(--text); padding:10px 14px;
+  border-radius:14px; font-size:14px; font-weight:500; z-index:200;
+  animation:toastIn 0.3s ease-out;
+  box-shadow:0 8px 30px rgba(0,0,0,0.4);
+  display:flex; align-items:center; gap:10px;
+  max-width:calc(100% - 32px);
+  border:1px solid var(--border2);
 }
+.toast-msg { flex:1; }
+.toast-undo {
+  background:var(--accent); color:var(--bg); border:none;
+  border-radius:8px; padding:6px 14px;
+  font-family:var(--font); font-size:13px; font-weight:700;
+  cursor:pointer; flex-shrink:0; letter-spacing:-0.2px;
+}
+.toast-undo:active { filter:brightness(0.85); }
+.toast-timer {
+  width:100%; height:3px; background:var(--border);
+  border-radius:0 0 14px 14px; position:absolute; bottom:0; left:0;
+  overflow:hidden;
+}
+.toast-timer-bar {
+  height:100%; background:var(--accent); border-radius:0 0 14px 14px;
+  animation:toastCountdown 5s linear forwards;
+}
+@keyframes toastCountdown { from { width:100%; } to { width:0%; } }
 @keyframes toastIn { from { opacity:0; transform:translateX(-50%) translateY(20px); } }
 
 /* Settings */
@@ -1218,14 +1239,24 @@ function SwipeableCard({ children, onSwipeLeft, onSwipeRight, leftLabel, rightLa
     if (ratio >= THRESHOLD) {
       // Swipe longo — executa ação
       const direction = currentX.current < 0 ? "left" : "right";
-      const fullOffset = direction === "left" ? -w : w;
-      setTransitioning(true);
-      setOffset(fullOffset);
-      setTimeout(() => {
-        setDismissed(true);
-        if (direction === "left" && onSwipeLeft) onSwipeLeft();
-        if (direction === "right" && onSwipeRight) onSwipeRight();
-      }, 200);
+      if (direction === "left") {
+        // Apagar: card sai da tela e desaparece
+        const fullOffset = -w;
+        setTransitioning(true);
+        setOffset(fullOffset);
+        setTimeout(() => {
+          setDismissed(true);
+          if (onSwipeLeft) onSwipeLeft();
+        }, 200);
+      } else {
+        // Revisar: card desliza, executa ação, e volta ao lugar
+        setTransitioning(true);
+        setOffset(w * 0.3); // desliza parcialmente para feedback visual
+        if (onSwipeRight) onSwipeRight();
+        setTimeout(() => {
+          setOffset(0);
+        }, 300);
+      }
     } else {
       // Swipe curto — volta
       setTransitioning(true);
@@ -1477,9 +1508,11 @@ function App() {
   const [trips, setTrips] = useState([]);
   const [currentTrip, setCurrentTrip] = useState(null);
   const [currentExpense, setCurrentExpense] = useState(null);
-  const [toast, setToast] = useState(null);
+  const [toast, setToast] = useState(null); // string | { msg, undo, timer }
   const [config, setConfig] = useState({ nome: "", participantes_frequentes: [], gemini_api_key: "" });
   const [loaded, setLoaded] = useState(false);
+  // Undo system (v1.3.1)
+  const undoRef = useRef(null); // { undoFn, timerId }
 
   // Load data
   useEffect(() => {
@@ -1531,10 +1564,73 @@ function App() {
     });
   }, []);
 
-  const showToast = useCallback((msg) => {
-    setToast(msg);
-    setTimeout(() => setToast(null), 2000);
+  const showToast = useCallback((msg, undoFn) => {
+    // Limpa undo anterior se existir
+    if (undoRef.current?.timerId) clearTimeout(undoRef.current.timerId);
+    undoRef.current = null;
+
+    if (undoFn) {
+      // Toast com botão desfazer — fica 5 segundos
+      const timerId = setTimeout(() => {
+        setToast(null);
+        undoRef.current = null;
+      }, 5000);
+      undoRef.current = { undoFn, timerId };
+      setToast({ msg, hasUndo: true });
+    } else {
+      // Toast simples — fica 2 segundos
+      setToast({ msg, hasUndo: false });
+      setTimeout(() => setToast(null), 2000);
+    }
   }, []);
+
+  const handleUndo = useCallback(() => {
+    if (!undoRef.current) return;
+    const { undoFn, timerId } = undoRef.current;
+    clearTimeout(timerId);
+    undoRef.current = null;
+    setToast(null);
+    undoFn();
+  }, []);
+
+  // Shake to undo (v1.3.1) — detecta chacoalhada no iPhone
+  useEffect(() => {
+    let lastShake = 0;
+    const SHAKE_THRESHOLD = 25;
+    const SHAKE_COOLDOWN = 1000;
+    let lastX = 0, lastY = 0, lastZ = 0;
+    let hasReading = false;
+
+    const onMotion = (e) => {
+      const acc = e.accelerationIncludingGravity;
+      if (!acc) return;
+      if (!hasReading) {
+        lastX = acc.x; lastY = acc.y; lastZ = acc.z;
+        hasReading = true;
+        return;
+      }
+      const dx = Math.abs(acc.x - lastX);
+      const dy = Math.abs(acc.y - lastY);
+      const dz = Math.abs(acc.z - lastZ);
+      lastX = acc.x; lastY = acc.y; lastZ = acc.z;
+
+      if ((dx + dy + dz) > SHAKE_THRESHOLD) {
+        const now = Date.now();
+        if (now - lastShake > SHAKE_COOLDOWN && undoRef.current) {
+          lastShake = now;
+          handleUndo();
+        }
+      }
+    };
+
+    // iOS 13+ requer permissão para DeviceMotion
+    if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") {
+      // Permissão será solicitada no primeiro gesto do usuário — não aqui
+      // Registramos o listener de qualquer forma; se não houver permissão, simplesmente não dispara
+    }
+    window.addEventListener("devicemotion", onMotion);
+    return () => window.removeEventListener("devicemotion", onMotion);
+  }, [handleUndo]);
 
   // ─── Fase 3 (v1.3.1): Fila offline de processamento de IA ──────────
   // Quando o iPhone volta a ter internet, processa despesas que foram
@@ -1690,9 +1786,20 @@ function App() {
           onOpen={(t) => { setCurrentTrip(t); setView("tripDetail"); }}
           onCreate={(t) => { saveTrip(t); setCurrentTrip(t); setView("tripDetail"); }}
           onDeleteTrip={async (tripId) => {
+            // Guarda snapshot para undo antes de apagar
+            const deletedTrip = trips.find(t => t.viagem_id === tripId);
             await dbDelete("viagens", tripId);
             setTrips(prev => prev.filter(t => t.viagem_id !== tripId));
-            showToast("Viagem excluída");
+            showToast("Viagem excluída", () => {
+              // Undo: restaura a viagem
+              if (deletedTrip) {
+                dbPut("viagens", deletedTrip);
+                setTrips(prev => {
+                  const next = [...prev, deletedTrip];
+                  return next.sort((a, b) => (b.data_inicio || "").localeCompare(a.data_inicio || ""));
+                });
+              }
+            });
           }}
           onSettings={() => setView("settings")}
         />
@@ -1706,12 +1813,22 @@ function App() {
           onExport={() => setView("export")}
           onSaveTrip={saveTrip}
           onDeleteExpense={(expId) => {
+            const deletedExpense = currentTrip.despesas.find(d => d.despesa_id === expId);
             const updated = {
               ...currentTrip,
               despesas: currentTrip.despesas.filter(d => d.despesa_id !== expId)
             };
             saveTrip(updated);
-            showToast("Despesa excluída");
+            showToast("Despesa excluída", () => {
+              // Undo: restaura a despesa
+              if (deletedExpense) {
+                const restored = {
+                  ...updated,
+                  despesas: [...updated.despesas, deletedExpense]
+                };
+                saveTrip(restored);
+              }
+            });
           }}
           onReviewExpense={(expId) => {
             const updated = {
@@ -1782,7 +1899,17 @@ function App() {
           showToast={showToast}
         />
       )}
-      {toast && <div className="toast">{toast}</div>}
+      {toast && (
+        <div className="toast">
+          <span className="toast-msg">{toast.msg || toast}</span>
+          {toast.hasUndo && (
+            <button className="toast-undo" onClick={handleUndo}>Desfazer</button>
+          )}
+          {toast.hasUndo && (
+            <div className="toast-timer"><div className="toast-timer-bar" /></div>
+          )}
+        </div>
+      )}
     </>
   );
 }
