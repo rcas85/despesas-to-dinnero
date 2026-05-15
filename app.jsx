@@ -1176,6 +1176,110 @@ html, body, #root {
 .preview-tappable:active { opacity:0.85; }
 `;
 
+// ─── Swipeable Card (v1.3.1) ─────────────────────────────────────────
+// Componente wrapper que adiciona gestos de swipe a qualquer card.
+// Swipe esquerda = ação de perigo (apagar), swipe direita = ação positiva (revisar).
+// Swipe longo (>50% da largura) executa direto; swipe curto volta ao lugar.
+function SwipeableCard({ children, onSwipeLeft, onSwipeRight, leftLabel, rightLabel, leftColor, rightColor }) {
+  const containerRef = useRef(null);
+  const startX = useRef(0);
+  const currentX = useRef(0);
+  const swiping = useRef(false);
+  const [offset, setOffset] = useState(0);
+  const [transitioning, setTransitioning] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+
+  const THRESHOLD = 0.35; // 35% da largura do card para executar
+
+  const onTouchStart = (e) => {
+    if (e.touches.length !== 1) return;
+    startX.current = e.touches[0].clientX;
+    currentX.current = 0;
+    swiping.current = true;
+    setTransitioning(false);
+  };
+
+  const onTouchMove = (e) => {
+    if (!swiping.current) return;
+    const dx = e.touches[0].clientX - startX.current;
+    // Só permite swipe se há handler para a direção
+    if (dx < 0 && !onSwipeLeft) return;
+    if (dx > 0 && !onSwipeRight) return;
+    currentX.current = dx;
+    setOffset(dx);
+  };
+
+  const onTouchEnd = () => {
+    if (!swiping.current) return;
+    swiping.current = false;
+    const w = containerRef.current?.offsetWidth || 300;
+    const ratio = Math.abs(currentX.current) / w;
+
+    if (ratio >= THRESHOLD) {
+      // Swipe longo — executa ação
+      const direction = currentX.current < 0 ? "left" : "right";
+      const fullOffset = direction === "left" ? -w : w;
+      setTransitioning(true);
+      setOffset(fullOffset);
+      setTimeout(() => {
+        setDismissed(true);
+        if (direction === "left" && onSwipeLeft) onSwipeLeft();
+        if (direction === "right" && onSwipeRight) onSwipeRight();
+      }, 200);
+    } else {
+      // Swipe curto — volta
+      setTransitioning(true);
+      setOffset(0);
+    }
+  };
+
+  if (dismissed) return null;
+
+  const bgLeft = leftColor || "var(--danger)";
+  const bgRight = rightColor || "var(--accent)";
+  const showingLeft = offset < -20;
+  const showingRight = offset > 20;
+
+  return (
+    <div
+      ref={containerRef}
+      style={{ position: "relative", overflow: "hidden", borderRadius: "var(--radius)", margin: "8px 16px" }}
+    >
+      {/* Fundo revelado ao deslizar */}
+      <div style={{
+        position: "absolute", inset: 0,
+        display: "flex", alignItems: "center",
+        justifyContent: showingLeft ? "flex-end" : "flex-start",
+        padding: "0 20px",
+        background: showingLeft ? bgLeft : showingRight ? bgRight : "transparent",
+        color: "white", fontSize: 13, fontWeight: 600, fontFamily: "var(--font)",
+        letterSpacing: "-0.2px",
+        transition: swiping.current ? "none" : "background 0.2s",
+      }}>
+        {showingLeft && (leftLabel || "Apagar")}
+        {showingRight && (rightLabel || "Revisado")}
+      </div>
+
+      {/* Card deslizante */}
+      <div
+        onTouchStart={onTouchStart}
+        onTouchMove={onTouchMove}
+        onTouchEnd={onTouchEnd}
+        onTouchCancel={onTouchEnd}
+        style={{
+          transform: `translateX(${offset}px)`,
+          transition: transitioning ? "transform 0.2s ease-out" : "none",
+          position: "relative",
+          zIndex: 1,
+          touchAction: "pan-y",
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
 // ─── Attachment Viewer (Fase 2, v1.2.7) ────────────────────────────────
 // Visualizador full-screen APENAS para imagens.
 // PDFs não passam por aqui — vão direto pro Quick Look nativo do iOS via openPdfNative().
@@ -1493,23 +1597,29 @@ function App() {
             ...updatedTrip.despesas[idx],
             dados_nf: {
               ...updatedTrip.despesas[idx].dados_nf,
-              estabelecimento: r.estabelecimento || updatedTrip.despesas[idx].dados_nf?.estabelecimento || "Sem nome",
+              // Preenche só dados factuais (estabelecimento, valor, data) se estavam vazios
+              estabelecimento: updatedTrip.despesas[idx].dados_nf?.estabelecimento === "Sem nome"
+                ? (r.estabelecimento || "Sem nome")
+                : updatedTrip.despesas[idx].dados_nf?.estabelecimento,
               cnpj: r.cnpj || updatedTrip.despesas[idx].dados_nf?.cnpj || null,
-              valor: r.valor_total || updatedTrip.despesas[idx].dados_nf?.valor || 0,
-              data_despesa: r.data_despesa || updatedTrip.despesas[idx].dados_nf?.data_despesa,
+              valor: updatedTrip.despesas[idx].dados_nf?.valor || r.valor_total || 0,
+              data_despesa: updatedTrip.despesas[idx].dados_nf?.data_despesa || r.data_despesa,
               horario: r.horario || updatedTrip.despesas[idx].dados_nf?.horario || null,
               extraido_por_ia: true,
               confianca_extracao: r.confianca,
             },
-            categoria_dinnero: r.categoria_sugerida || updatedTrip.despesas[idx].categoria_dinnero || "",
-            justificativa: r.justificativa_sugerida || updatedTrip.despesas[idx].justificativa || "",
-            campos_condicionais: {
-              diarias: r.diarias_extraidas != null ? r.diarias_extraidas : (updatedTrip.despesas[idx].campos_condicionais?.diarias || null),
-              placa_veiculo: r.placa_veiculo || updatedTrip.despesas[idx].campos_condicionais?.placa_veiculo || null,
-              km_rodados: r.km_rodados != null ? r.km_rodados : (updatedTrip.despesas[idx].campos_condicionais?.km_rodados || null),
+            // Categoria e justificativa ficam como SUGESTÕES para o usuário aceitar
+            sugestoes_ia: {
+              categoria_sugerida: r.categoria_sugerida || "",
+              justificativa_sugerida: r.justificativa_sugerida || "",
+              diarias_extraidas: r.diarias_extraidas,
+              placa_veiculo: r.placa_veiculo,
+              km_rodados: r.km_rodados,
+              participantes_estimados: r.participantes_estimados,
+              confianca: r.confianca,
             },
             pendente_extracao: false,
-            atualizado_por_fila: true, // badge temporário
+            atualizado_por_fila: true,
           };
 
           updatedTrip.despesas[idx] = updated;
@@ -1579,6 +1689,11 @@ function App() {
           trips={trips}
           onOpen={(t) => { setCurrentTrip(t); setView("tripDetail"); }}
           onCreate={(t) => { saveTrip(t); setCurrentTrip(t); setView("tripDetail"); }}
+          onDeleteTrip={async (tripId) => {
+            await dbDelete("viagens", tripId);
+            setTrips(prev => prev.filter(t => t.viagem_id !== tripId));
+            showToast("Viagem excluída");
+          }}
           onSettings={() => setView("settings")}
         />
       )}
@@ -1590,6 +1705,24 @@ function App() {
           onEdit={(exp) => { setCurrentExpense(exp); setView("editExpense"); }}
           onExport={() => setView("export")}
           onSaveTrip={saveTrip}
+          onDeleteExpense={(expId) => {
+            const updated = {
+              ...currentTrip,
+              despesas: currentTrip.despesas.filter(d => d.despesa_id !== expId)
+            };
+            saveTrip(updated);
+            showToast("Despesa excluída");
+          }}
+          onReviewExpense={(expId) => {
+            const updated = {
+              ...currentTrip,
+              despesas: currentTrip.despesas.map(d =>
+                d.despesa_id === expId ? { ...d, status_revisao: "revisado", atualizado_por_fila: false } : d
+              )
+            };
+            saveTrip(updated);
+            showToast("Marcado como revisado");
+          }}
           showToast={showToast}
         />
       )}
@@ -1655,7 +1788,7 @@ function App() {
 }
 
 // ─── Trips Page ──────────────────────────────────────────────────────────
-function TripsPage({ trips, onOpen, onCreate, onSettings }) {
+function TripsPage({ trips, onOpen, onCreate, onDeleteTrip, onSettings }) {
   const [showNew, setShowNew] = useState(false);
   const [newName, setNewName] = useState("");
   const [newStart, setNewStart] = useState(todayISO());
@@ -1698,14 +1831,54 @@ function TripsPage({ trips, onOpen, onCreate, onSettings }) {
         {active.length > 0 && (
           <>
             <div className="section-head">Em andamento</div>
-            {active.map(t => <TripCard key={t.viagem_id} trip={t} onClick={() => onOpen(t)} />)}
+            {active.map(t => (
+              <SwipeableCard
+                key={t.viagem_id}
+                onSwipeLeft={() => onDeleteTrip(t.viagem_id)}
+                leftLabel="Apagar"
+              >
+                <div className="card" onClick={() => onOpen(t)} style={{ cursor:"pointer", margin:0 }}>
+                  <div className="card-row">
+                    <div className="card-icon" style={{ background:"var(--accent-dim)", color:"var(--accent)" }}>{Icons.plane}</div>
+                    <div className="card-body">
+                      <div className="card-title">{t.nome}</div>
+                      <div className="card-sub">{formatDate(t.data_inicio)} — {formatDate(t.data_fim)} · {(t.despesas||[]).length} despesa{(t.despesas||[]).length !== 1 ? "s" : ""}</div>
+                    </div>
+                    <div className="card-right">
+                      <div className="card-amount" style={{ color:"var(--accent)" }}>{formatCurrency((t.despesas||[]).reduce((s,d) => s + (d.dados_nf?.valor||0), 0))}</div>
+                      <div className="pill green" style={{ marginTop:6 }}>Em andamento</div>
+                    </div>
+                  </div>
+                </div>
+              </SwipeableCard>
+            ))}
           </>
         )}
 
         {closed.length > 0 && (
           <>
             <div className="section-head">Histórico</div>
-            {closed.map(t => <TripCard key={t.viagem_id} trip={t} onClick={() => onOpen(t)} />)}
+            {closed.map(t => (
+              <SwipeableCard
+                key={t.viagem_id}
+                onSwipeLeft={() => onDeleteTrip(t.viagem_id)}
+                leftLabel="Apagar"
+              >
+                <div className="card" onClick={() => onOpen(t)} style={{ cursor:"pointer", margin:0 }}>
+                  <div className="card-row">
+                    <div className="card-icon" style={{ background:"var(--accent-dim)", color:"var(--accent)" }}>{Icons.plane}</div>
+                    <div className="card-body">
+                      <div className="card-title">{t.nome}</div>
+                      <div className="card-sub">{formatDate(t.data_inicio)} — {formatDate(t.data_fim)} · {(t.despesas||[]).length} despesa{(t.despesas||[]).length !== 1 ? "s" : ""}</div>
+                    </div>
+                    <div className="card-right">
+                      <div className="card-amount" style={{ color:"var(--accent)" }}>{formatCurrency((t.despesas||[]).reduce((s,d) => s + (d.dados_nf?.valor||0), 0))}</div>
+                      <div className={`pill ${t.status === "fechada" ? "yellow" : "blue"}`} style={{ marginTop:6 }}>{t.status === "fechada" ? "Fechada" : "Exportada"}</div>
+                    </div>
+                  </div>
+                </div>
+              </SwipeableCard>
+            ))}
           </>
         )}
 
@@ -1780,7 +1953,7 @@ function TripCard({ trip, onClick }) {
 }
 
 // ─── Trip Detail Page ────────────────────────────────────────────────────
-function TripDetailPage({ trip, onBack, onCapture, onEdit, onExport, onSaveTrip, showToast }) {
+function TripDetailPage({ trip, onBack, onCapture, onEdit, onExport, onSaveTrip, onDeleteExpense, onReviewExpense, showToast }) {
   const despesas = trip.despesas || [];
   const total = despesas.reduce((s, d) => s + (d.dados_nf?.valor || 0), 0);
   const allReviewed = despesas.length > 0 && despesas.every(d => d.status_revisao === "revisado");
@@ -1848,8 +2021,29 @@ function TripDetailPage({ trip, onBack, onCapture, onEdit, onExport, onSaveTrip,
         {despesas.length > 0 ? (
           <>
             <div className="section-head">Despesas</div>
-            {despesas.map((d) => (
-              <ExpenseCard key={d.despesa_id} expense={d} onClick={() => onEdit(d)} />
+            {[...despesas]
+              .sort((a, b) => {
+                // Pendentes de IA primeiro
+                const aPend = a.pendente_extracao ? 0 : 1;
+                const bPend = b.pendente_extracao ? 0 : 1;
+                if (aPend !== bPend) return aPend - bPend;
+                // Atualizadas pela fila em segundo
+                const aUpd = a.atualizado_por_fila ? 0 : 1;
+                const bUpd = b.atualizado_por_fila ? 0 : 1;
+                if (aUpd !== bUpd) return aUpd - bUpd;
+                // Depois por data (mais recente primeiro)
+                return 0;
+              })
+              .map((d) => (
+              <SwipeableCard
+                key={d.despesa_id}
+                onSwipeLeft={() => onDeleteExpense(d.despesa_id)}
+                onSwipeRight={d.status_revisao !== "revisado" ? () => onReviewExpense(d.despesa_id) : undefined}
+                leftLabel="Apagar"
+                rightLabel="Revisado ✓"
+              >
+                <ExpenseCard expense={d} onClick={() => onEdit(d)} noMargin />
+              </SwipeableCard>
             ))}
           </>
         ) : (
@@ -1934,7 +2128,7 @@ function TripDetailPage({ trip, onBack, onCapture, onEdit, onExport, onSaveTrip,
   );
 }
 
-function ExpenseCard({ expense, onClick }) {
+function ExpenseCard({ expense, onClick, noMargin }) {
   const d = expense;
   const isMeal = MEAL_CATEGORIES.includes(d.categoria_dinnero);
   const isReviewed = d.status_revisao === "revisado";
@@ -1944,7 +2138,7 @@ function ExpenseCard({ expense, onClick }) {
   const wasUpdatedByQueue = !!d.atualizado_por_fila;
 
   return (
-    <div className="card" onClick={onClick} style={{ cursor:"pointer" }}>
+    <div className="card" onClick={onClick} style={{ cursor:"pointer", ...(noMargin ? { margin: 0 } : {}) }}>
       <div className="card-row">
         {isPdf ? (
           <div className="card-icon" style={{ background:"var(--blue-dim)", color:"var(--blue)" }}>
@@ -2148,6 +2342,9 @@ function CapturePage({ trip, config, onSave, onBack }) {
     .filter(p => !participantes.includes(p.nome));
 
   const canSave = estab.trim() && cat;
+  const isOffline = !navigator.onLine;
+  // Offline com foto: permite salvar direto sem preencher nada
+  const canQuickSave = isOffline && photo && hasKey;
 
   return (
     <div className="page">
@@ -2300,9 +2497,14 @@ function CapturePage({ trip, config, onSave, onBack }) {
               </div>
             </div>
             <div style={{ height:16 }} />
-            <button className="fab" onClick={() => setStep(2)} disabled={!estab.trim()}>
+            <button className="fab" onClick={() => setStep(2)} disabled={!estab.trim() && !canQuickSave}>
               Próximo: categorizar
             </button>
+            {canQuickSave && (
+              <button className="fab secondary" onClick={handleSave} style={{ marginTop:0 }}>
+                {Icons.sparkle} Salvar e processar depois (offline)
+              </button>
+            )}
           </>
         )}
 
@@ -2432,9 +2634,14 @@ function CapturePage({ trip, config, onSave, onBack }) {
               />
             </div>
 
-            <button className="fab" onClick={handleSave} disabled={!canSave}>
+            <button className="fab" onClick={handleSave} disabled={!canSave && !canQuickSave}>
               {Icons.check} Salvar despesa
             </button>
+            {canQuickSave && !canSave && (
+              <div style={{ padding:"0 16px", fontSize:12, color:"var(--text3)", textAlign:"center", lineHeight:1.4 }}>
+                Sem internet — a IA preencherá os dados quando a conexão voltar.
+              </div>
+            )}
             <div style={{ height:80 }} />
           </>
         )}
@@ -2471,6 +2678,14 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
   const [horario, setHorario] = useState(expense.dados_nf?.horario || null);
   const [cnpj, setCnpj] = useState(expense.dados_nf?.cnpj || null);
   const [justSuggested, setJustSuggested] = useState("");
+  // Fase 3 (v1.3.1): sugestões vindas da fila offline
+  const queueSuggestions = expense.sugestoes_ia || null;
+  const [catSuggestedFromQueue, setCatSuggestedFromQueue] = useState(queueSuggestions?.categoria_sugerida || "");
+  const [justSuggestedFromQueue, setJustSuggestedFromQueue] = useState(queueSuggestions?.justificativa_sugerida || "");
+  const [diariasFromQueue] = useState(queueSuggestions?.diarias_extraidas);
+  const [placaFromQueue] = useState(queueSuggestions?.placa_veiculo || "");
+  const [kmFromQueue] = useState(queueSuggestions?.km_rodados);
+  const [participantesEstimadosQueue] = useState(queueSuggestions?.participantes_estimados);
   // Anexo: detecta tipo a partir dos metadados salvos
   const attachmentType = expense.captura?.anexo_tipo || (expense.captura?.foto_thumbnail_base64?.startsWith("data:application/pdf") ? "pdf" : "image");
   const attachmentName = expense.captura?.anexo_nome_original || null;
@@ -2528,6 +2743,7 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
       // Limpa flags da fila offline ao salvar manualmente
       pendente_extracao: false,
       atualizado_por_fila: false,
+      sugestoes_ia: null,
     };
     onSave(updated);
   };
@@ -2632,6 +2848,18 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
           </div>
         )}
 
+        {/* Sugestões da fila offline (v1.3.1) */}
+        {catSuggestedFromQueue && cat !== catSuggestedFromQueue && !catSuggested && (
+          <div className="suggest-cat" style={{marginTop:12}}>
+            <span style={{display:"flex"}}>{Icons.sparkle}</span>
+            <span>IA sugere: <strong>{catSuggestedFromQueue}</strong></span>
+            <button className="ai-action" style={{borderColor:"var(--accent)", color:"var(--accent)"}} onClick={() => { setCat(catSuggestedFromQueue); setCatSuggestedFromQueue(""); }}>
+              Aplicar
+            </button>
+            <button className="sc-x" onClick={() => setCatSuggestedFromQueue("")} aria-label="Dispensar">{Icons.x}</button>
+          </div>
+        )}
+
         <div className="section-head">Dados</div>
         <div className="field">
           <label>Estabelecimento</label>
@@ -2677,13 +2905,46 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
           <div className="field">
             <label>{profile.campo.label}</label>
             {profile.campo.tipo === "numero_inteiro" && cat === "Hospedagens" && (
-              <input type="number" value={diarias} onChange={e => setDiarias(e.target.value)} inputMode="numeric" />
+              <>
+                <input type="number" value={diarias} onChange={e => setDiarias(e.target.value)} inputMode="numeric" />
+                {diariasFromQueue != null && !diarias && (
+                  <div className="suggest-cat" style={{marginTop:6, marginBottom:0}}>
+                    <span style={{display:"flex"}}>{Icons.sparkle}</span>
+                    <span>IA sugere: <strong>{diariasFromQueue} diária{diariasFromQueue !== 1 ? "s" : ""}</strong></span>
+                    <button className="ai-action" style={{borderColor:"var(--accent)", color:"var(--accent)"}} onClick={() => setDiarias(String(diariasFromQueue))}>
+                      Aplicar
+                    </button>
+                  </div>
+                )}
+              </>
             )}
             {profile.campo.tipo === "alfanumerico" && (
-              <input value={placa} onChange={e => setPlaca(e.target.value.toUpperCase())} />
+              <>
+                <input value={placa} onChange={e => setPlaca(e.target.value.toUpperCase())} />
+                {placaFromQueue && !placa && (
+                  <div className="suggest-cat" style={{marginTop:6, marginBottom:0}}>
+                    <span style={{display:"flex"}}>{Icons.sparkle}</span>
+                    <span>IA sugere: <strong>{placaFromQueue}</strong></span>
+                    <button className="ai-action" style={{borderColor:"var(--accent)", color:"var(--accent)"}} onClick={() => setPlaca(placaFromQueue)}>
+                      Aplicar
+                    </button>
+                  </div>
+                )}
+              </>
             )}
             {profile.campo.tipo === "numero_inteiro" && cat !== "Hospedagens" && (
-              <input type="number" value={km} onChange={e => setKm(e.target.value)} inputMode="numeric" />
+              <>
+                <input type="number" value={km} onChange={e => setKm(e.target.value)} inputMode="numeric" />
+                {kmFromQueue != null && !km && (
+                  <div className="suggest-cat" style={{marginTop:6, marginBottom:0}}>
+                    <span style={{display:"flex"}}>{Icons.sparkle}</span>
+                    <span>IA sugere: <strong>{kmFromQueue} km</strong></span>
+                    <button className="ai-action" style={{borderColor:"var(--accent)", color:"var(--accent)"}} onClick={() => setKm(String(kmFromQueue))}>
+                      Aplicar
+                    </button>
+                  </div>
+                )}
+              </>
             )}
           </div>
         )}
@@ -2691,6 +2952,15 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
         {isMeal && (
           <>
             <div className="section-head" style={{ marginTop:4 }}>Participantes</div>
+            {participantesEstimadosQueue != null && participantes.length < participantesEstimadosQueue && (
+              <div className="suggest-cat" style={{marginBottom:8}}>
+                <span style={{display:"flex"}}>{Icons.sparkle}</span>
+                <span>
+                  IA estima <strong>{participantesEstimadosQueue} {participantesEstimadosQueue === 1 ? "pessoa" : "pessoas"}</strong>
+                  {participantes.length > 0 && ` · faltam ${participantesEstimadosQueue - participantes.length}`}
+                </span>
+              </div>
+            )}
             {participantes.map((p, i) => (
               <div key={i} className="participant-row">
                 <span style={{ color:"var(--text3)" }}>{Icons.user}</span>
@@ -2734,6 +3004,18 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
               Aplicar
             </button>
             <button className="sc-x" onClick={() => setJustSuggested("")} aria-label="Dispensar">{Icons.x}</button>
+          </div>
+        )}
+
+        {/* Sugestão de justificativa da fila offline (v1.3.1) */}
+        {justSuggestedFromQueue && justSuggestedFromQueue !== justificativa && !justSuggested && (
+          <div className="suggest-cat" style={{marginTop:8, marginBottom:0}}>
+            <span style={{display:"flex"}}>{Icons.sparkle}</span>
+            <span>IA sugere: <strong>{justSuggestedFromQueue}</strong></span>
+            <button className="ai-action" style={{borderColor:"var(--accent)", color:"var(--accent)"}} onClick={() => { setJust(justSuggestedFromQueue); setJustSuggestedFromQueue(""); }}>
+              Aplicar
+            </button>
+            <button className="sc-x" onClick={() => setJustSuggestedFromQueue("")} aria-label="Dispensar">{Icons.x}</button>
           </div>
         )}
 
