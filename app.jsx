@@ -2,7 +2,7 @@ const { useState, useEffect, useCallback, useRef } = React;
 
 // ─── Build flags ─────────────────────────────────────────────────────────
 const IS_BETA = true;
-const APP_VERSION_BASE = "1.3.0";
+const APP_VERSION_BASE = "1.3.1";
 const APP_VERSION = IS_BETA ? `${APP_VERSION_BASE}-beta` : APP_VERSION_BASE;
 
 // ─── Constants ───────────────────────────────────────────────────────────
@@ -1432,6 +1432,138 @@ function App() {
     setTimeout(() => setToast(null), 2000);
   }, []);
 
+  // ─── Fase 3 (v1.3.1): Fila offline de processamento de IA ──────────
+  // Quando o iPhone volta a ter internet, processa despesas que foram
+  // capturadas offline (pendente_extracao === true).
+  const queueRunningRef = useRef(false);
+  const editingExpenseIdRef = useRef(null);
+
+  // Atualiza a ref de qual despesa está sendo editada
+  useEffect(() => {
+    editingExpenseIdRef.current = (view === "editExpense" && currentExpense)
+      ? currentExpense.despesa_id
+      : null;
+  }, [view, currentExpense]);
+
+  const processOfflineQueue = useCallback(async () => {
+    if (queueRunningRef.current) return;
+    const apiKey = config.gemini_api_key?.trim();
+    if (!apiKey) return;
+
+    // Encontra a viagem ativa com despesas pendentes
+    const trip = currentTrip?.status === "em_andamento" ? currentTrip : null;
+    if (!trip) return;
+    const pending = (trip.despesas || []).filter(d => d.pendente_extracao && d.captura?.foto_thumbnail_base64);
+    if (!pending.length) return;
+
+    // Verifica internet real (evita captive portal de Wi-Fi de hotel)
+    try {
+      const probe = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`,
+        { method: "GET", signal: AbortSignal.timeout(5000) }
+      );
+      if (!probe.ok) return;
+    } catch {
+      return; // Sem internet real
+    }
+
+    queueRunningRef.current = true;
+    let updatedTrip = { ...trip, despesas: [...trip.despesas] };
+    let processedCount = 0;
+
+    for (const despesa of pending) {
+      // Pula se o usuário está editando esta despesa
+      if (editingExpenseIdRef.current === despesa.despesa_id) continue;
+
+      const maxRetries = 3;
+      let success = false;
+
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          const r = await geminiExtractFromImage(apiKey, despesa.captura.foto_thumbnail_base64);
+
+          // Monta a despesa atualizada com os dados da IA
+          const idx = updatedTrip.despesas.findIndex(d => d.despesa_id === despesa.despesa_id);
+          if (idx < 0) break;
+
+          // Verifica de novo se não está sendo editada
+          if (editingExpenseIdRef.current === despesa.despesa_id) break;
+
+          const updated = {
+            ...updatedTrip.despesas[idx],
+            dados_nf: {
+              ...updatedTrip.despesas[idx].dados_nf,
+              estabelecimento: r.estabelecimento || updatedTrip.despesas[idx].dados_nf?.estabelecimento || "Sem nome",
+              cnpj: r.cnpj || updatedTrip.despesas[idx].dados_nf?.cnpj || null,
+              valor: r.valor_total || updatedTrip.despesas[idx].dados_nf?.valor || 0,
+              data_despesa: r.data_despesa || updatedTrip.despesas[idx].dados_nf?.data_despesa,
+              horario: r.horario || updatedTrip.despesas[idx].dados_nf?.horario || null,
+              extraido_por_ia: true,
+              confianca_extracao: r.confianca,
+            },
+            categoria_dinnero: r.categoria_sugerida || updatedTrip.despesas[idx].categoria_dinnero || "",
+            justificativa: r.justificativa_sugerida || updatedTrip.despesas[idx].justificativa || "",
+            campos_condicionais: {
+              diarias: r.diarias_extraidas != null ? r.diarias_extraidas : (updatedTrip.despesas[idx].campos_condicionais?.diarias || null),
+              placa_veiculo: r.placa_veiculo || updatedTrip.despesas[idx].campos_condicionais?.placa_veiculo || null,
+              km_rodados: r.km_rodados != null ? r.km_rodados : (updatedTrip.despesas[idx].campos_condicionais?.km_rodados || null),
+            },
+            pendente_extracao: false,
+            atualizado_por_fila: true, // badge temporário
+          };
+
+          updatedTrip.despesas[idx] = updated;
+          processedCount++;
+          success = true;
+
+          const nome = r.estabelecimento || "despesa";
+          showToast(`✓ ${nome} extraído`);
+
+          break; // Saiu do retry loop
+        } catch (e) {
+          // Backoff exponencial: 1s, 3s, 9s
+          const delay = Math.pow(3, attempt) * 1000;
+          logEvent("gemini_error", `Fila offline: tentativa ${attempt + 1} falhou`, {
+            despesa_id: despesa.despesa_id,
+            error: String(e?.message || e),
+            delay_ms: delay,
+          });
+          if (attempt < maxRetries - 1) {
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
+        }
+      }
+
+      // Intervalo entre despesas (1 segundo)
+      if (success && pending.indexOf(despesa) < pending.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+
+    // Persiste tudo de uma vez
+    if (processedCount > 0) {
+      await saveTrip(updatedTrip);
+    }
+
+    queueRunningRef.current = false;
+  }, [currentTrip, config.gemini_api_key, saveTrip, showToast]);
+
+  // Dispara a fila quando volta online
+  useEffect(() => {
+    const onOnline = () => {
+      // Pequeno delay para estabilizar a conexão
+      setTimeout(() => processOfflineQueue(), 2000);
+    };
+    window.addEventListener("online", onOnline);
+
+    // Também tenta ao carregar (caso já esteja online com pendentes)
+    if (loaded && navigator.onLine) {
+      setTimeout(() => processOfflineQueue(), 3000);
+    }
+
+    return () => window.removeEventListener("online", onOnline);
+  }, [loaded, processOfflineQueue]);
+
   if (!loaded) return (
     <div style={{ height:"100%", display:"flex", alignItems:"center", justifyContent:"center", background:"var(--bg)" }}>
       <style>{CSS}</style>
@@ -1653,6 +1785,7 @@ function TripDetailPage({ trip, onBack, onCapture, onEdit, onExport, onSaveTrip,
   const total = despesas.reduce((s, d) => s + (d.dados_nf?.valor || 0), 0);
   const allReviewed = despesas.length > 0 && despesas.every(d => d.status_revisao === "revisado");
   const isActive = trip.status === "em_andamento";
+  const pendingAI = despesas.filter(d => d.pendente_extracao).length;
   const [showClose, setShowClose] = useState(false);
   const [showEditTrip, setShowEditTrip] = useState(false);
   const [editNome, setEditNome] = useState(trip.nome);
@@ -1695,6 +1828,16 @@ function TripDetailPage({ trip, onBack, onCapture, onEdit, onExport, onSaveTrip,
           </div>
           <div className="totalizer-val">{formatCurrency(total)}</div>
         </div>
+
+        {pendingAI > 0 && (
+          <div className="ai-banner loading" style={{ margin:"8px 16px 4px" }}>
+            <span className="ai-icon">{Icons.sparkle}</span>
+            <span className="ai-text">
+              {pendingAI} despesa{pendingAI !== 1 ? "s" : ""} pendente{pendingAI !== 1 ? "s" : ""} de IA
+              {navigator.onLine ? " · processando…" : " · aguardando internet"}
+            </span>
+          </div>
+        )}
 
         {isActive && (
           <button className="fab" onClick={onCapture}>
@@ -1797,6 +1940,8 @@ function ExpenseCard({ expense, onClick }) {
   const isReviewed = d.status_revisao === "revisado";
   const hasPhoto = !!d.captura?.foto_thumbnail_base64;
   const isPdf = d.captura?.anexo_tipo === "pdf" || d.captura?.foto_thumbnail_base64?.startsWith("data:application/pdf");
+  const isPendingAI = !!d.pendente_extracao;
+  const wasUpdatedByQueue = !!d.atualizado_por_fila;
 
   return (
     <div className="card" onClick={onClick} style={{ cursor:"pointer" }}>
@@ -1817,6 +1962,16 @@ function ExpenseCard({ expense, onClick }) {
           <div className="card-sub">
             {d.categoria_dinnero || "Sem categoria"} · {formatDate(d.dados_nf?.data_despesa)}
           </div>
+          {isPendingAI && (
+            <div className="card-badge" style={{ background:"var(--blue-dim)", color:"var(--blue)" }}>
+              {Icons.sparkle} Pendente IA
+            </div>
+          )}
+          {wasUpdatedByQueue && !isPendingAI && (
+            <div className="card-badge" style={{ background:"var(--accent-dim)", color:"var(--accent)" }}>
+              {Icons.sparkle} Atualizado
+            </div>
+          )}
         </div>
         <div className="card-right">
           <div className="card-amount">{formatCurrency(d.dados_nf?.valor)}</div>
@@ -1972,6 +2127,8 @@ function CapturePage({ trip, config, onSave, onBack }) {
       } : null,
       status_revisao: "rascunho",
       modais_dinnero_aplicaveis: buildModais(cat),
+      // Fase 3 (v1.3.1): marca como pendente se a IA não rodou
+      pendente_extracao: (photo && hasKey && !aiExtracted) ? true : false,
     };
     onSave(expense);
   };
@@ -2368,6 +2525,9 @@ function EditExpensePage({ trip, expense, config, onSave, onDelete, onBack }) {
       participantes: isMeal ? { internos: participantes, externos: [] } : null,
       status_revisao: reviewed ? "revisado" : "rascunho",
       modais_dinnero_aplicaveis: buildModais(cat),
+      // Limpa flags da fila offline ao salvar manualmente
+      pendente_extracao: false,
+      atualizado_por_fila: false,
     };
     onSave(updated);
   };
