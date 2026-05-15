@@ -6,6 +6,20 @@ Formato: `[Versão] - YYYY-MM-DD`
 
 ---
 
+## [PWA 1.3.0-beta] - 2026-05-15 — Validações pré-exportação (Fase 3, entrega 1)
+
+### Adicionado
+- **Validações pré-exportação em dois níveis** na ExportPage:
+  - **Bloqueantes** (box vermelho, desabilitam o botão Exportar): despesa sem categoria, despesa sem anexo quando a categoria exige
+  - **Alertas** (box amarelo, permitem exportar com aviso): sem justificativa, valor zerado, campos condicionais faltando (diárias / placa / km), refeição sem participantes
+- Box vermelho "Impede exportação" separado do box amarelo "Atenção"
+
+### Mudado
+- Despesa sem categoria não acumula mais o alerta "sem foto da NF" — mostra só o bloqueante de categoria, que é a raiz do problema
+- O botão Exportar agora considera bloqueantes além da seleção vazia
+
+---
+
 ## [PWA 1.2.9-beta] - 2026-05-11 — Refinamentos pré-Fase 3
 
 ### Adicionado

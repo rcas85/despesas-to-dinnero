@@ -2,7 +2,7 @@ const { useState, useEffect, useCallback, useRef } = React;
 
 // ─── Build flags ─────────────────────────────────────────────────────────
 const IS_BETA = true;
-const APP_VERSION_BASE = "1.2.9";
+const APP_VERSION_BASE = "1.3.0";
 const APP_VERSION = IS_BETA ? `${APP_VERSION_BASE}-beta` : APP_VERSION_BASE;
 
 // ─── Constants ───────────────────────────────────────────────────────────
@@ -2638,14 +2638,37 @@ function ExportPage({ trip, onBack, onExported }) {
 
   const total = despesas.filter(d => selected.has(d.despesa_id)).reduce((s, d) => s + (d.dados_nf?.valor || 0), 0);
 
-  // Validation
-  const warnings = [];
+  // Validation — dois níveis: bloqueantes (impedem export) e alertas (permitem)
+  const blockers = [];
+  const alerts = [];
   despesas.filter(d => selected.has(d.despesa_id)).forEach(d => {
-    if (!d.categoria_dinnero) warnings.push(`${d.dados_nf?.estabelecimento}: sem categoria`);
-    if (!d.justificativa) warnings.push(`${d.dados_nf?.estabelecimento}: sem justificativa`);
-    const profile = CATEGORY_PROFILES[d.categoria_dinnero];
-    if (profile?.requer_anexo !== false && !d.captura?.foto_thumbnail_base64) {
-      warnings.push(`${d.dados_nf?.estabelecimento}: sem foto da NF`);
+    const nome = d.dados_nf?.estabelecimento || "Sem nome";
+    const cat = d.categoria_dinnero;
+
+    // Bloqueantes
+    if (!cat) {
+      blockers.push(`${nome}: sem categoria`);
+    } else {
+      const profile = CATEGORY_PROFILES[cat];
+      if (profile?.requer_anexo !== false && !d.captura?.foto_thumbnail_base64) {
+        blockers.push(`${nome}: sem foto da NF`);
+      }
+    }
+
+    // Alertas
+    if (!d.justificativa) alerts.push(`${nome}: sem justificativa`);
+    if (!d.dados_nf?.valor) alerts.push(`${nome}: valor zerado`);
+    if (cat === "Hospedagens" && !d.campos_condicionais?.diarias) {
+      alerts.push(`${nome}: sem nº de diárias`);
+    }
+    if (["Combustível em viagem", "Combustível de frotas"].includes(cat) && !d.campos_condicionais?.placa_veiculo) {
+      alerts.push(`${nome}: sem placa do veículo`);
+    }
+    if (["Km rodado em viagem", "Km rodado desp. administrativo"].includes(cat) && !d.campos_condicionais?.km_rodados) {
+      alerts.push(`${nome}: sem quilômetros rodados`);
+    }
+    if (MEAL_CATEGORIES.includes(cat) && !d.participantes?.internos?.length) {
+      alerts.push(`${nome}: sem participantes`);
     }
   });
 
@@ -2706,10 +2729,19 @@ function ExportPage({ trip, onBack, onExported }) {
           <div className="totalizer-val">{formatCurrency(total)}</div>
         </div>
 
-        {warnings.length > 0 && (
+        {blockers.length > 0 && (
+          <div style={{ margin:"8px 16px", padding:"12px", background:"var(--danger-dim)", border:"1px solid rgba(239,68,68,0.2)", borderRadius:"var(--radius-sm)" }}>
+            <div style={{ fontSize:12, fontWeight:600, color:"var(--danger)", marginBottom:4 }}>Impede exportação</div>
+            {blockers.map((w, i) => (
+              <div key={i} style={{ fontSize:12, color:"var(--text2)", lineHeight:1.4 }}>• {w}</div>
+            ))}
+          </div>
+        )}
+
+        {alerts.length > 0 && (
           <div style={{ margin:"8px 16px", padding:"12px", background:"var(--warn-dim)", border:"1px solid rgba(245,158,11,0.2)", borderRadius:"var(--radius-sm)" }}>
             <div style={{ fontSize:12, fontWeight:600, color:"var(--warn)", marginBottom:4 }}>Atenção</div>
-            {warnings.map((w, i) => (
+            {alerts.map((w, i) => (
               <div key={i} style={{ fontSize:12, color:"var(--text2)", lineHeight:1.4 }}>• {w}</div>
             ))}
           </div>
@@ -2730,7 +2762,7 @@ function ExportPage({ trip, onBack, onExported }) {
           </div>
         ))}
 
-        <button className="fab" onClick={handleExport} disabled={selected.size === 0 || exporting} style={{ marginTop:16 }}>
+        <button className="fab" onClick={handleExport} disabled={selected.size === 0 || exporting || blockers.length > 0} style={{ marginTop:16 }}>
           {Icons.export} {exporting ? "Exportando…" : "Exportar manifest.json"}
         </button>
         <div style={{ padding:"0 16px", fontSize:12, color:"var(--text3)", textAlign:"center", lineHeight:1.4 }}>
