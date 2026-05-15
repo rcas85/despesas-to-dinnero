@@ -12,21 +12,21 @@ Estrutura: cada item tem **prioridade** (alta/média/baixa), **horizonte** (curt
 PWA rodando em produção (`despesas-to-dinnero.vercel.app`), instalada no iPhone do Ricardo, capturando despesas manualmente com persistência em IndexedDB e exportação para iCloud Drive funcional.
 
 ### ✅ Fase 2 — Inteligência (Gemini) — CONCLUÍDA
-**Versão final:** v1.2.7-beta (Fase 2 fechada) + v1.2.9-beta (refinamentos pré-Fase 3 entregues, aguardando teste em campo)
+**Versão final:** v1.2.7-beta (Fase 2 fechada) + v1.2.9-beta (refinamentos pré-Fase 3)
 
 Funcionalidades entregues:
 - Extração automática via Gemini 2.5 Flash para imagens e PDFs
 - Auto-preenchimento de estabelecimento, valor, data, CNPJ, horário, categoria
 - Sugestões inteligentes de categoria e justificativa (com botão "Aplicar")
 - Campos condicionais extraídos automaticamente (diárias, placa, km rodados)
-- **Inferência de quantidade de participantes em refeições** (v1.2.9)
+- Inferência de quantidade de participantes em refeições (v1.2.9)
 - Suporte a PDF como anexo (botão separado da câmera)
-- **Opção "Foto da fototeca"** além de câmera direta (v1.2.9)
+- Opção "Foto da fototeca" além de câmera direta (v1.2.9)
 - Visualizador de imagens com zoom programático completo
 - PDFs abrem no Quick Look nativo do iOS
 - Sistema de log de debug para versões beta
-- **Auto-cadastro de participantes** com modelo enriquecido (validado/usado_em/ultimo_uso) (v1.2.9)
-- **Fuzzy match no autocomplete de nomes** (v1.2.9)
+- Auto-cadastro de participantes com modelo enriquecido (validado/usado_em/ultimo_uso) (v1.2.9)
+- Fuzzy match no autocomplete de nomes (v1.2.9)
 - Modo offline gracioso: captura funciona sem internet, preenchimento manual sempre possível
 
 Validação em campo:
@@ -37,51 +37,21 @@ Validação em campo:
 - Passagem aérea (PDF da Latam): testado e funcionando
 - Primeira viagem real iniciada em mai/2026 com v1.2.7-beta; primeira despesa real capturada com sucesso
 
----
+### 🔨 Fase 3 — Refinamentos da PWA — EM ANDAMENTO
+**Versão atual:** v1.3.0-beta
 
-## Próximo passo confirmado
-
-### 🔨 Fase 3 — Refinamentos da PWA
-**Status:** próximo a iniciar (em chat novo)
-**Escopo definido pela Spec 1.0 + backlog da viagem:**
-- Modo offline robusto (fila de processamento de IA) — **detalhamento abaixo**
-- Junção de múltiplas fotos em um anexo
-- Validações pré-exportação
-- Itens do backlog da primeira viagem real (ver "Backlog" abaixo)
-
-**Gatilho:** primeira viagem real em curso usando v1.2.9-beta; ao retornar, prioriza com base no feedback
-
----
-
-## Backlog da primeira viagem real (maio 2026)
-
-Coletado durante uso de campo da v1.2.7-beta e v1.2.9-beta.
-
-### Inferência de quantidade de participantes em refeições — IMPLEMENTADA (v1.2.9)
-Auto-preenchimento via IA do nº de pessoas na refeição. Status: entregue, aguardando validação em campo.
-
-### Opção "Foto da fototeca" — IMPLEMENTADA (v1.2.9)
-Status: entregue, aguardando validação em campo.
-
-### Auto-cadastro de nomes na lista de frequentes — IMPLEMENTADA (v1.2.9)
-Status: entregue, aguardando validação em campo.
-
-### Fuzzy match para erros de digitação de nomes — IMPLEMENTADA PARCIALMENTE (v1.2.9)
-**Status:** parte preventiva entregue (autocomplete tolerante a typos). Parte de retroalimentação fica para Fase 4.
-**O que falta na Fase 4:** caminho de volta do agente Claude for Chrome → PWA, para que quando o agente confirmar um nome canônico no Dinnero, a PWA atualize o nome (ou marque como `validado`).
-
-### Reconhecimento facial / contagem por foto de mesa — EM AVALIAÇÃO
-**Prioridade:** indefinida (Ricardo vai pensar)
-**Por que:** Tecnicamente possível mas levanta questões importantes:
-- LGPD aplicada a fotos de colegas (dados biométricos)
-- Consentimento das pessoas fotografadas
-- Política Bunge sobre fotos de funcionários
-- Risco de erro de identificação com consequência política
-**Recomendação:** consultar Compliance/TI da Bunge antes de qualquer implementação.
+| # | Entrega | Versão | Status |
+|---|---------|--------|--------|
+| 1 | Validações pré-exportação | v1.3.0 | ✅ Concluída |
+| 2 | Fila offline de processamento de IA | v1.3.1 | ⏳ Próxima |
+| 3 | Junção de múltiplas fotos em um anexo | v1.3.2 | ⏳ Aguardando |
 
 ---
 
 ## Itens parametrizados para Fase 3
+
+### ✅ Validações pré-exportação — CONCLUÍDA (v1.3.0)
+Dois níveis de severidade: bloqueantes (box vermelho, impede exportação) e alertas (box amarelo, permite exportar com aviso). Checa categoria, anexo, justificativa, valor, campos condicionais por categoria e participantes em refeições.
 
 ### Fila offline de processamento de IA
 **Prioridade:** alta
@@ -94,8 +64,8 @@ Status: entregue, aguardando validação em campo.
 - Toasts discretos por extração concluída
 - Despesas que ganharam dados via IA recebem badge "Atualizado" pra revisão
 
-**Decisões pendentes (decidir no início da Fase 3):**
-- Visibilidade da fila: badge no header da viagem com contador, indicação só no card, ou discreto
+**Decisões pendentes (decidir antes de implementar):**
+- Visibilidade da fila: badge no header da viagem com contador, indicação só no card, ou ambos
 - Toggle nas Configurações: "Processar fila automaticamente quando houver internet" (default ON) — dá controle pra usuário revisar antes em casos sensíveis
 - Comportamento se o usuário abrir uma despesa pendente enquanto a fila está rodando
 
@@ -106,16 +76,26 @@ Status: entregue, aguardando validação em campo.
 **Por que:** Algumas NFs têm múltiplas páginas. Dinnero aceita só 1 anexo por cargo. Se a PWA não juntar, você precisa juntar manualmente.
 **Gatilho:** primeira NF de várias páginas que apareça
 
-### Validações pré-exportação
-**Prioridade:** média
-**Por que:** Antes de gerar o pacote para o agente do Chrome, validar que todas as despesas têm os campos obrigatórios preenchidos para sua categoria (ex: hospedagem sem diárias, refeição sem participantes).
-**Gatilho:** Fase 3 iniciada
-
 ### Service Worker customizado com estratégia de cache
 **Prioridade:** baixa
 **Por que:** Hoje a PWA usa o SW padrão. Um SW customizado permitiria cache mais inteligente (stale-while-revalidate), suporte real a offline-first, e fallbacks robustos para recursos críticos.
 **Considerações:** trade-off entre complexidade vs benefício. Só vale com alguma necessidade real (ex: voltarmos a depender de CDN externo no futuro).
 **Gatilho:** quando houver demanda concreta por offline-first mais robusto
+
+---
+
+## Backlog da primeira viagem real (maio 2026)
+
+### Inferência de quantidade de participantes em refeições — IMPLEMENTADA (v1.2.9)
+### Opção "Foto da fototeca" — IMPLEMENTADA (v1.2.9)
+### Auto-cadastro de nomes na lista de frequentes — IMPLEMENTADA (v1.2.9)
+
+### Fuzzy match para erros de digitação de nomes — IMPLEMENTADA PARCIALMENTE (v1.2.9)
+**O que falta na Fase 4:** caminho de volta do agente Claude for Chrome → PWA, para que quando o agente confirmar um nome canônico no Dinnero, a PWA atualize o nome (ou marque como `validado`).
+
+### Reconhecimento facial / contagem por foto de mesa — EM AVALIAÇÃO
+**Prioridade:** indefinida (Ricardo vai pensar)
+**Recomendação:** consultar Compliance/TI da Bunge antes de qualquer implementação (LGPD, consentimento, política Bunge sobre fotos de funcionários).
 
 ---
 
@@ -125,6 +105,16 @@ Status: entregue, aguardando validação em campo.
 **Prioridade:** baixa (caiu de prioridade)
 **Por que caiu:** A IA do Gemini agora gera a justificativa sugerida automaticamente baseada em estabelecimento + horário + categoria. Templates manuais talvez não sejam mais necessários.
 **Re-avaliar:** se a IA sugerir justificativas ruins repetidamente em algum caso de uso específico
+
+### Usar repo GitHub como banco de dados de prestações
+**Prioridade:** média (ideia nova, mai/2026)
+**Por que:** Em vez de exportar via iCloud Drive manualmente, a PWA salvaria os pacotes (manifest JSON) diretamente no repo GitHub, criando um histórico acessível e versionado.
+**Considerações:**
+- JSONs das prestações pesam kilobytes — OK para o repo
+- Fotos das NFs pesam megabytes — NÃO devem ir pro repo (limite GitHub 1 GB)
+- Separação: JSONs no repo, fotos ficam no dispositivo até serem consumidas pelo agente
+- Possibilidade de expiração: PWA pede autorização para excluir prestações com mais de 1 ano
+**Gatilho:** quando o atrito do iCloud manual virar incômodo recorrente
 
 ---
 
