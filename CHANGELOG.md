@@ -6,6 +6,31 @@ Formato: `[Versão] - YYYY-MM-DD`
 
 ---
 
+## [PWA 1.3.1-beta] - 2026-05-15 — Fase 3: Fila offline + Swipe gestures + Undo
+
+### Adicionado
+- **Fila offline de processamento de IA**: despesas capturadas sem internet são marcadas como `pendente_extracao` e processadas automaticamente quando a conexão volta. Detector de internet real (evita captive portal), retry com backoff exponencial (1s → 3s → 9s), toasts por despesa processada
+- **Sugestões da fila**: dados da IA vindos da fila offline chegam como sugestões (banners com botão "Aplicar") em vez de preenchimento direto — categoria, justificativa, campos condicionais e estimativa de participantes aparecem para revisão do usuário
+- **Salvar rápido offline**: botão "Salvar e processar depois (offline)" permite capturar despesa só com a foto, sem preencher dados/categoria — a IA faz depois
+- **Despesas pendentes no topo**: na lista de despesas da viagem, pendentes de IA aparecem primeiro, seguidas das atualizadas pela fila
+- **Badge "Pendente IA"** (azul) e **"Atualizado"** (verde) nos cards de despesa
+- **Banner de fila** na TripDetailPage: "N despesas pendentes de IA · processando…" ou "· aguardando internet"
+- **Swipe gestures**: deslizar card para esquerda apaga (viagens e despesas), deslizar para direita marca despesa como revisada
+- **Toast com botão "Desfazer"**: após apagar por swipe, toast fica 5 segundos com barra de progresso e botão "Desfazer" que restaura o item
+- **Shake to undo**: chacoalhar o iPhone nos 5 segundos após apagar executa o desfazer (via DeviceMotionEvent)
+
+### Mudado
+- Toast redesenhado: fundo escuro com borda, suporta modo simples (2s) e modo undo (5s com botão)
+- Swipe direita (revisar) não faz o card sumir — desliza parcialmente e volta ao lugar com a pill atualizada
+- ExportPage: validações da v1.3.0 continuam funcionando normalmente
+
+### Notas
+- Segunda entrega da Fase 3, mais complexa: ~270 linhas adicionadas
+- Shake to undo requer permissão de DeviceMotion no iOS 13+ (concedida automaticamente na primeira vez que o sistema perguntar)
+- Componente SwipeableCard é reutilizável — pode ser usado em qualquer lista futura
+
+---
+
 ## [PWA 1.3.0-beta] - 2026-05-15 — Fase 3: Validações pré-exportação
 
 ### Adicionado

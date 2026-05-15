@@ -37,14 +37,25 @@ Validação em campo:
 - Passagem aérea (PDF da Latam): testado e funcionando
 - Primeira viagem real iniciada em mai/2026 com v1.2.7-beta; primeira despesa real capturada com sucesso
 
-### 🔨 Fase 3 — Refinamentos da PWA — EM ANDAMENTO
-**Versão atual:** v1.3.0-beta
+### ✅ Fase 3 — Refinamentos da PWA — CONCLUÍDA
+**Versão final:** v1.3.1-beta
 
 | # | Entrega | Versão | Status |
 |---|---------|--------|--------|
 | 1 | Validações pré-exportação | v1.3.0 | ✅ Concluída |
-| 2 | Fila offline de processamento de IA | v1.3.1 | ⏳ Próxima |
-| 3 | Junção de múltiplas fotos em um anexo | v1.3.2 | ⏳ Aguardando |
+| 2 | Fila offline + swipe + undo | v1.3.1 | ✅ Concluída |
+| 3 | Junção de múltiplas fotos em um anexo | — | ⏭️ Adiada (sem demanda real) |
+
+Entrega 3 adiada: nunca apareceu NF de várias páginas em uso real. Gatilho para retomar: quando aparecer.
+
+---
+
+## Próximo passo confirmado
+
+### 🔨 Fase 4 — Agente Claude for Chrome
+**Status:** próximo a iniciar
+**Escopo:** prompt-base do agente que preenche o Dinnero a partir do pacote exportado pela PWA
+**Pré-requisito:** Fase 3 concluída (pacote de exportação validado e confiável)
 
 ---
 
@@ -53,23 +64,13 @@ Validação em campo:
 ### ✅ Validações pré-exportação — CONCLUÍDA (v1.3.0)
 Dois níveis de severidade: bloqueantes (box vermelho, impede exportação) e alertas (box amarelo, permite exportar com aviso). Checa categoria, anexo, justificativa, valor, campos condicionais por categoria e participantes em refeições.
 
-### Fila offline de processamento de IA
-**Prioridade:** alta
-**Por que:** Hoje, captura sem internet salva a despesa mas não roda a IA — o usuário precisa lembrar de abrir cada despesa e clicar "Re-extrair com IA" manualmente quando voltar a ter sinal. Em viagem internacional sem roaming, ou rota com 4G ruim, isso vira um trabalho de prestação de contas posterior em vez de tempo real.
+### ✅ Fila offline de processamento de IA — CONCLUÍDA (v1.3.1)
+Despesas capturadas offline são marcadas como pendentes e processadas automaticamente quando a internet volta. Dados da IA chegam como sugestões (banners com "Aplicar"), não preenchimento direto. Inclui salvar rápido offline, despesas pendentes no topo da lista, badge "Pendente IA" / "Atualizado", swipe gestures (esquerda = apagar, direita = revisar), toast com botão "Desfazer" por 5 segundos, e shake to undo.
 
-**Comportamento esperado:**
-- Captura offline marca despesa como `pendente_extracao` (status visível)
-- Detector dispara quando o iPhone volta a ter internet (evento `online` + check leve com fetch ao Gemini para evitar falso positivo de captive portal de Wi-Fi de hotel)
-- Worker processa a fila uma de cada vez, com 1s entre chamadas e retry exponencial até 3 tentativas
-- Toasts discretos por extração concluída
-- Despesas que ganharam dados via IA recebem badge "Atualizado" pra revisão
-
-**Decisões pendentes (decidir antes de implementar):**
-- Visibilidade da fila: badge no header da viagem com contador, indicação só no card, ou ambos
-- Toggle nas Configurações: "Processar fila automaticamente quando houver internet" (default ON) — dá controle pra usuário revisar antes em casos sensíveis
-- Comportamento se o usuário abrir uma despesa pendente enquanto a fila está rodando
-
-**Gatilho:** após primeira viagem real onde a falta de internet cause atrito perceptível
+**Decisões tomadas:**
+- Visibilidade: badge no header da viagem com contador
+- Toggle: sem toggle, sempre automático
+- Conflito de edição: fila pula despesa que o usuário está editando
 
 ### Junção de múltiplas fotos em um anexo
 **Prioridade:** média
@@ -187,6 +188,22 @@ Dois níveis de severidade: bloqueantes (box vermelho, impede exportação) e al
 - Suporte a múltiplas moedas (despesas internacionais)
 - Exportação alternativa em PDF para arquivo pessoal
 - Estatísticas de uso da própria PWA (quanto tempo economizou, quantas despesas processou)
+
+---
+
+## Checklist de fechamento de fase
+
+Executar SEMPRE ao fechar uma fase ou entrega significativa. Evita documentação desatualizada.
+
+```
+[ ] app.jsx — versão atualizada (APP_VERSION_BASE)
+[ ] CHANGELOG.md — entrada da versão registrada
+[ ] ROADMAP.md — status da fase/entrega atualizado
+[ ] CLAUDE.md — componentes, modelo de dados e funcionalidades atualizados
+[ ] Deploy feito e testado no iPhone
+[ ] Commit de docs: ./deploy.sh "docs: atualização pós-vX.Y.Z"
+[ ] Memória do projeto atualizada no Claude Chat
+```
 
 ---
 
