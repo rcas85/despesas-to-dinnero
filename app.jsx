@@ -2,7 +2,7 @@ const { useState, useEffect, useCallback, useRef } = React;
 
 // ─── Build flags ─────────────────────────────────────────────────────────
 const IS_BETA = true;
-const APP_VERSION_BASE = "1.3.1";
+const APP_VERSION_BASE = "1.4.0";
 const APP_VERSION = IS_BETA ? `${APP_VERSION_BASE}-beta` : APP_VERSION_BASE;
 
 // ─── Constants ───────────────────────────────────────────────────────────
@@ -3255,7 +3255,14 @@ function ExportPage({ trip, onBack, onExported }) {
         valor_total: total,
         despesas: selectedDespesas.map(d => ({
           ...d,
-          captura: { ...d.captura, foto_thumbnail_base64: undefined },
+          captura: {
+            ...d.captura,
+            // v1.4: foto embutida no manifest como data URL (base64)
+            // Preparado para v2.0: quando Google Drive API entrar,
+            // trocar por upload separado e referência por URL
+            anexo_data_base64: d.captura?.foto_thumbnail_base64 || null,
+            foto_thumbnail_base64: undefined,
+          },
         })),
       };
 
@@ -3332,10 +3339,10 @@ function ExportPage({ trip, onBack, onExported }) {
         ))}
 
         <button className="fab" onClick={handleExport} disabled={selected.size === 0 || exporting || blockers.length > 0} style={{ marginTop:16 }}>
-          {Icons.export} {exporting ? "Exportando…" : "Exportar manifest.json"}
+          {Icons.export} {exporting ? "Exportando…" : "Exportar pacote completo"}
         </button>
         <div style={{ padding:"0 16px", fontSize:12, color:"var(--text3)", textAlign:"center", lineHeight:1.4 }}>
-          O pacote será salvo como JSON. As fotos das NFs precisam ser compartilhadas separadamente via galeria.
+          O pacote inclui dados e fotos das NFs em um único arquivo JSON.
         </div>
         <div className="safe-bottom" />
       </div>
